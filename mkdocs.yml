@@ -1,0 +1,83 @@
+site_name: ZeroGraph
+site_description: 轻量级图执行引擎，零外部依赖
+site_author: 韩飞摩
+copyright: Copyright &copy; 2025 韩飞摩
+
+theme:
+  name: material
+  language: zh
+  palette:
+    primary: indigo
+    accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+
+nav:
+  - 首页: index.md
+  - 快速上手: getting-started.md
+  - 教程:
+    - 基础图构建: tutorials/basic-graph.md
+    - 状态与 Reducer: tutorials/state-and-reducers.md
+    - 条件分支与动态路由: tutorials/conditional-routing.md
+    - 流式输出: tutorials/streaming.md
+    - 检查点与持久化: tutorials/checkpointing.md
+    - 中断与恢复: tutorials/interrupt-resume.md
+    - 子图嵌套: tutorials/subgraphs.md
+    - 函数式 API: tutorials/functional-api.md
+    - 缓存与 Store: tutorials/cache-and-store.md
+    - 错误处理与重试: tutorials/error-handling.md
+  - 操作指南:
+    - 构建 ReAct 智能体: how-to/react-agent.md
+    - 构建多 Agent 监督者: how-to/supervisor.md
+    - 构建群智协作: how-to/swarm.md
+    - LLM 流式适配: how-to/llm-streaming.md
+    - 图可视化: how-to/visualization.md
+    - SQLite 检查点配置: how-to/sqlite-checkpoint.md
+  - API 参考:
+    - 总览: api/index.md
+    - StateGraph: api/graph.md
+    - Channel 系统: api/channels.md
+    - 检查点: api/checkpoint.md
+    - 核心类型: api/types.md
+    - 预构建组件: api/prebuilt.md
+    - 函数式 API: api/func.md
+    - 缓存: api/cache.md
+    - Store: api/store.md
+    - LLM 适配器: api/adapters.md
+    - 异常: api/errors.md
+    - 常量: api/constants.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [.]
+          options:
+            show_source: false
+            show_root_heading: true
+            show_root_toc_entry: false
+            heading_level: 2
+            members_order: source
+            docstring_style: google
+            show_signature_annotations: true
+            signature_crossrefs: true
+            separate_signature: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
