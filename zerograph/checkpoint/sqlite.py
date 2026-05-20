@@ -22,6 +22,46 @@ from zerograph.checkpoint.base import (
 __all__ = ("SqliteSaver", "AsyncSqliteSaver")
 
 
+_ZG_TYPE = "__zerograph_type__"
+
+
+class _CheckpointEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, frozenset):
+            return {_ZG_TYPE: "frozenset", "data": sorted(obj, key=repr)}
+        if isinstance(obj, set):
+            return {_ZG_TYPE: "set", "data": sorted(obj, key=repr)}
+        if isinstance(obj, tuple):
+            return {_ZG_TYPE: "tuple", "data": list(obj)}
+        if isinstance(obj, bytes):
+            return {_ZG_TYPE: "bytes", "data": obj.hex()}
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _decode_obj(obj):
+    if isinstance(obj, dict) and _ZG_TYPE in obj:
+        t = obj[_ZG_TYPE]
+        if t == "set":
+            return set(obj["data"])
+        if t == "frozenset":
+            return frozenset(obj["data"])
+        if t == "tuple":
+            return tuple(obj["data"])
+        if t == "bytes":
+            return bytes.fromhex(obj["data"])
+    return obj
+
+
+def _dump_json(obj) -> str:
+    return json.dumps(obj, cls=_CheckpointEncoder)
+
+
+def _load_json(text: str) -> Any:
+    return json.loads(text, object_hook=_decode_obj)
+
+
 def _new_checkpoint_id() -> str:
     return str(uuid.uuid4())
 
@@ -63,7 +103,9 @@ class SqliteSaver(BaseCheckpointSaver):
     def __init__(self, conn_string: str | Path = "checkpoints.db") -> None:
         self._conn_string = str(conn_string)
         self._local = threading.local()
-        self._setup_conn(self._get_conn())
+        self._lock = threading.Lock()
+        self._connections: set[sqlite3.Connection] = set()
+        self._get_conn()
 
     def _get_conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
@@ -72,8 +114,15 @@ class SqliteSaver(BaseCheckpointSaver):
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
             conn.row_factory = sqlite3.Row
+            try:
+                self._setup_conn(conn)
+            except Exception:
+                conn.close()
+                self._local.conn = None
+                raise
+            with self._lock:
+                self._connections.add(conn)
             self._local.conn = conn
-            self._setup_conn(conn)
         return self._local.conn
 
     def _setup_conn(self, conn: sqlite3.Connection) -> None:
@@ -81,9 +130,15 @@ class SqliteSaver(BaseCheckpointSaver):
         conn.commit()
 
     def close(self) -> None:
-        if hasattr(self._local, "conn") and self._local.conn is not None:
-            self._local.conn.close()
-            self._local.conn = None
+        with self._lock:
+            conns = list(self._connections)
+            self._connections.clear()
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._local = threading.local()
 
     def __enter__(self) -> SqliteSaver:
         return self
@@ -124,8 +179,8 @@ class SqliteSaver(BaseCheckpointSaver):
             if row is None:
                 return None
 
-        checkpoint = json.loads(row["checkpoint"])
-        metadata = json.loads(row["metadata"])
+        checkpoint = _load_json(row["checkpoint"])
+        metadata = _load_json(row["metadata"])
         parent_checkpoint_id = row["parent_checkpoint_id"]
         fetched_id = row["checkpoint_id"]
 
@@ -163,7 +218,11 @@ class SqliteSaver(BaseCheckpointSaver):
         conn = self._get_conn()
         thread_id = self._get_thread_id(config)
         checkpoint_ns = self._get_checkpoint_ns(config)
-        checkpoint_id = checkpoint.get("id", _new_checkpoint_id())
+        checkpoint_id = checkpoint.get("id")
+        if not checkpoint_id:
+            checkpoint_id = _new_checkpoint_id()
+            checkpoint = dict(checkpoint)
+            checkpoint["id"] = checkpoint_id
 
         parent_config_id = config.get("configurable", {}).get("checkpoint_id")
 
@@ -176,9 +235,9 @@ class SqliteSaver(BaseCheckpointSaver):
                 checkpoint_ns,
                 checkpoint_id,
                 parent_config_id,
-                json.dumps(checkpoint, default=str),
-                json.dumps(metadata, default=str),
-                checkpoint.get("ts", _iso_now()),
+                _dump_json(checkpoint),
+                _dump_json(metadata),
+                checkpoint.get("ts") or _iso_now(),
             ),
         )
         conn.commit()
@@ -201,9 +260,10 @@ class SqliteSaver(BaseCheckpointSaver):
         checkpoint_ns = self._get_checkpoint_ns(config)
         checkpoint_id = self._get_checkpoint_id(config)
         if not checkpoint_id:
-            return
+            raise ValueError("checkpoint_id is required in config to store writes")
 
         for tid, ch, val in writes:
+            tid = tid or task_id
             if isinstance(val, InterruptCls):
                 val = {"__interrupt__": True, "value": val.value, "id": val.id}
             conn.execute(
@@ -216,7 +276,7 @@ class SqliteSaver(BaseCheckpointSaver):
                     checkpoint_id,
                     tid,
                     ch,
-                    json.dumps(val, default=str),
+                    _dump_json(val),
                 ),
             )
         conn.commit()
@@ -262,8 +322,8 @@ class SqliteSaver(BaseCheckpointSaver):
 
         results = []
         for row in rows:
-            checkpoint = json.loads(row["checkpoint"])
-            metadata = json.loads(row["metadata"])
+            checkpoint = _load_json(row["checkpoint"])
+            metadata = _load_json(row["metadata"])
             fetched_id = row["checkpoint_id"]
             parent_checkpoint_id = row["parent_checkpoint_id"]
 
@@ -336,9 +396,9 @@ class SqliteSaver(BaseCheckpointSaver):
         result: list[PendingWrite] = []
         for r in rows:
             ch = r["channel"]
-            val = json.loads(r["value"])
+            val = _load_json(r["value"])
             if ch == INTERRUPT and isinstance(val, dict) and val.get("__interrupt__"):
-                val = InterruptCls(value=val["value"], id=val.get("id"))
+                val = InterruptCls(value=val.get("value"), id=val.get("id"))
             result.append((r["task_id"], ch, val))
         return result
 
@@ -355,15 +415,21 @@ class AsyncSqliteSaver(SqliteSaver):
     """
 
     def __init__(self, conn_string: str | Path = "checkpoints.db") -> None:
+        # Intentionally duplicates SqliteSaver.__init__ fields instead of
+        # calling super().__init__() so that :memory: connections can be
+        # routed through a single-thread executor.
         self._conn_string = str(conn_string)
         self._local = threading.local()
+        self._lock = threading.Lock()
         self._is_memory = self._conn_string == ":memory:"
-        self._setup_conn(self._get_conn())
+        self._connections: set[sqlite3.Connection] = set()
         if self._is_memory:
             import concurrent.futures
             self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            self._executor.submit(self._get_conn).result()
         else:
             self._executor = None
+            self._get_conn()
 
     async def __aenter__(self) -> AsyncSqliteSaver:
         return self
@@ -372,10 +438,10 @@ class AsyncSqliteSaver(SqliteSaver):
         self.close()
 
     def close(self) -> None:
-        super().close()
         if self._executor is not None:
             self._executor.shutdown(wait=False)
             self._executor = None
+        super().close()
 
     async def _to_thread(self, fn, *args, **kwargs):
         if self._is_memory and self._executor is not None:

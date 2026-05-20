@@ -89,24 +89,27 @@ def create_supervisor(
 
     graph = StateGraph(state_schema)
 
+    agent_names_set = set(agent_names)
+    path_map = {name: name for name in agent_names}
+    path_map[END] = END
+
     def supervisor_node(state: dict) -> dict:
-        response = llm_callable(state["messages"], tools=agent_tools)
+        response = llm_callable(state.get("messages", []), tools=agent_tools)
         return {"messages": [response]}
 
-    def route_from_supervisor(state: dict) -> str:
+    def route_from_supervisor(state: dict) -> str | list[str]:
         messages = state.get("messages", [])
         last = messages[-1] if messages else {}
         tool_calls = last.get("tool_calls", [])
         if tool_calls:
-            tc = tool_calls[0]
-            name = tc["function"]["name"]
-            if name in agent_names_set:
-                return name
+            names = [
+                tc["function"]["name"]
+                for tc in tool_calls
+                if tc.get("function", {}).get("name") in agent_names_set
+            ]
+            if names:
+                return names if len(names) > 1 else names[0]
         return END
-
-    agent_names_set = set(agent_names)
-    path_map = {name: name for name in agent_names}
-    path_map[END] = END
 
     graph.add_node("supervisor", supervisor_node)
     graph.add_edge(START, "supervisor")

@@ -79,9 +79,15 @@ def should_interrupt(
     if not any_updates:
         return []
 
+    if isinstance(interrupt_nodes, str):
+        interrupt_list = [interrupt_nodes]
+    else:
+        interrupt_list = list(interrupt_nodes)
+    if "*" in interrupt_list:
+        return list(tasks)
     return [
         task for task in tasks
-        if (interrupt_nodes == "*" or task.name in interrupt_nodes)
+        if task.name in interrupt_list
     ]
 
 
@@ -236,7 +242,6 @@ def _triggers(
 
 def prepare_next_tasks(
     checkpoint: dict,
-    pending_writes: list,
     nodes: dict,
     channels: Mapping[str, BaseChannel],
     config: dict,
@@ -340,10 +345,11 @@ def _read_proc_input(
     if isinstance(node_channels, list):
         val = {}
         for chan in node_channels:
-            if chan in channels:
-                if channels[chan].is_available():
-                    val[chan] = channels[chan].get()
-            elif not channels[chan].is_available():
+            if chan not in channels:
+                return MISSING
+            if channels[chan].is_available():
+                val[chan] = channels[chan].get()
+            else:
                 return MISSING
         return val
     elif isinstance(node_channels, str):

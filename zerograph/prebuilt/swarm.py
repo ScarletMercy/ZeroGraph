@@ -15,7 +15,7 @@ __all__ = ("create_swarm",)
 
 def _tag_agent_name(name: str, agent: Callable) -> Callable:
     """Wrap an agent to tag its output messages with the agent's node name."""
-    if asyncio.iscoroutinefunction(agent):
+    if asyncio.iscoroutinefunction(agent) or asyncio.iscoroutinefunction(getattr(agent, "__call__", None)):
         async def wrapper(state: dict) -> dict:
             result = await agent(state)
             return _tag_messages(name, result)
@@ -96,8 +96,16 @@ def create_swarm(
     graph = StateGraph(state_schema)
 
     for name, agent in zip(agent_names, agents):
-        tagged = _tag_agent_name(name, agent)
-        graph.add_node(name, tagged)
+        if hasattr(agent, "invoke"):
+            def _make_agent_wrapper(ag, n):
+                def wrapper(state):
+                    return _tag_messages(n, ag.invoke(state))
+                wrapper.__name__ = n
+                return wrapper
+            graph.add_node(name, _make_agent_wrapper(agent, name))
+        else:
+            tagged = _tag_agent_name(name, agent)
+            graph.add_node(name, tagged)
 
     # Shared tools node (optional)
     if tools:
@@ -121,7 +129,7 @@ def create_swarm(
                     return n
 
                 # Check for tool_calls from assistant
-                if last.get("tool_calls"):
+                if last.get("tool_calls") and tools:
                     return "tools"
 
                 # Check for handoff

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 from typing import Any, Generic
 
@@ -39,14 +40,21 @@ class EphemeralValue(Generic[Value], BaseChannel[Value, Value, Value]):
     def copy(self) -> EphemeralValue:
         empty = self.__class__(self.typ, self.guard)
         empty.key = self.key
-        empty.value = self.value
+        if self.value is not MISSING:
+            try:
+                empty.value = copy.deepcopy(self.value)
+            except Exception:
+                empty.value = self.value
         return empty
 
     def from_checkpoint(self, checkpoint: Value) -> EphemeralValue:
         empty = self.__class__(self.typ, self.guard)
         empty.key = self.key
         if checkpoint is not MISSING:
-            empty.value = checkpoint
+            try:
+                empty.value = copy.deepcopy(checkpoint)
+            except Exception:
+                empty.value = checkpoint
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:

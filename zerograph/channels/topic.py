@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 from typing import Any, Generic
 
@@ -48,13 +49,19 @@ class Topic(Generic[Value], BaseChannel[list[Value], Value, list[Value]]):
 
     def copy(self) -> Topic:
         empty = self.__class__(self.typ, self.accumulate, self.key)
-        empty.values = self.values.copy()
+        try:
+            empty.values = copy.deepcopy(self.values)
+        except Exception:
+            empty.values = self.values.copy()
         return empty
 
     def from_checkpoint(self, checkpoint) -> Topic:
         empty = self.__class__(self.typ, self.accumulate, self.key)
         if checkpoint is not MISSING:
-            empty.values = checkpoint
+            try:
+                empty.values = copy.deepcopy(checkpoint)
+            except Exception:
+                empty.values = list(checkpoint)
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:

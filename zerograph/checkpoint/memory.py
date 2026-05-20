@@ -31,7 +31,8 @@ def _iso_now() -> str:
 class InMemorySaver(BaseCheckpointSaver):
     """In-memory checkpoint storage."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_per_thread: int = 100) -> None:
+        self.max_per_thread = max_per_thread
         self.storage: dict[str, dict[str, dict[str, CheckpointTuple]]] = defaultdict(
             lambda: defaultdict(dict)
         )
@@ -46,6 +47,22 @@ class InMemorySaver(BaseCheckpointSaver):
     def _get_checkpoint_id(self, config: dict) -> str | None:
         return config.get("configurable", {}).get("checkpoint_id")
 
+    def _enrich_with_writes(self, tup: CheckpointTuple) -> CheckpointTuple:
+        """Return a deep-copied tuple with pending_writes from self.writes."""
+        key = (
+            self._get_thread_id(tup.config),
+            self._get_checkpoint_ns(tup.config),
+            tup.config.get("configurable", {}).get("checkpoint_id", ""),
+        )
+        pw = self.writes.get(key, [])
+        return CheckpointTuple(
+            config=copy.deepcopy(tup.config),
+            checkpoint=copy.deepcopy(tup.checkpoint),
+            metadata=copy.deepcopy(tup.metadata),
+            parent_config=copy.deepcopy(tup.parent_config) if tup.parent_config else None,
+            pending_writes=[(tid, ch, copy.deepcopy(val)) for tid, ch, val in pw],
+        )
+
     def get_tuple(self, config: dict) -> CheckpointTuple | None:
         thread_id = self._get_thread_id(config)
         checkpoint_ns = self._get_checkpoint_ns(config)
@@ -56,7 +73,7 @@ class InMemorySaver(BaseCheckpointSaver):
 
         if checkpoint_id:
             if checkpoint_id in ns_storage:
-                return ns_storage[checkpoint_id]
+                return self._enrich_with_writes(ns_storage[checkpoint_id])
             return None
 
         if not ns_storage:
@@ -66,14 +83,18 @@ class InMemorySaver(BaseCheckpointSaver):
             ns_storage.keys(),
             key=lambda x: ns_storage[x].checkpoint.get("ts", ""),
         )
-        return ns_storage[latest_id]
+        return self._enrich_with_writes(ns_storage[latest_id])
 
     def put(
         self, config: dict, checkpoint: Checkpoint, metadata: CheckpointMetadata
     ) -> dict:
         thread_id = self._get_thread_id(config)
         checkpoint_ns = self._get_checkpoint_ns(config)
-        checkpoint_id = checkpoint.get("id", _new_checkpoint_id())
+        checkpoint_id = checkpoint.get("id")
+        if not checkpoint_id:
+            checkpoint_id = _new_checkpoint_id()
+            checkpoint = dict(checkpoint)
+            checkpoint["id"] = checkpoint_id
 
         parent_config = config.get("configurable", {}).get("checkpoint_id")
 
@@ -87,11 +108,20 @@ class InMemorySaver(BaseCheckpointSaver):
             },
             checkpoint=copy.deepcopy(checkpoint),
             metadata=copy.deepcopy(metadata),
-            parent_config={"configurable": {"checkpoint_id": parent_config}} if parent_config else None,
+            parent_config={"configurable": {"thread_id": thread_id, "checkpoint_ns": checkpoint_ns, "checkpoint_id": parent_config}} if parent_config else None,
             pending_writes=[],
         )
 
         self.storage[thread_id][checkpoint_ns][checkpoint_id] = tup
+
+        # Evict oldest checkpoint if exceeding limit
+        ns_storage = self.storage[thread_id][checkpoint_ns]
+        if len(ns_storage) > self.max_per_thread:
+            oldest_id = min(ns_storage.keys(), key=lambda x: ns_storage[x].checkpoint.get("ts", ""))
+            del ns_storage[oldest_id]
+            # Also clean up associated writes
+            writes_key = (thread_id, checkpoint_ns, oldest_id)
+            self.writes.pop(writes_key, None)
 
         return {
             "configurable": {
@@ -108,12 +138,12 @@ class InMemorySaver(BaseCheckpointSaver):
         checkpoint_ns = self._get_checkpoint_ns(config)
         checkpoint_id = self._get_checkpoint_id(config)
         if not checkpoint_id:
-            return
+            raise ValueError("checkpoint_id is required in config to store writes")
 
         key = (thread_id, checkpoint_ns, checkpoint_id)
         existing = self.writes.get(key, [])
 
-        new_writes = [(w[0], w[1], w[2]) for w in writes]
+        new_writes = [(w[0] or task_id, w[1], copy.deepcopy(w[2])) for w in writes]
         for idx, (tid, ch, val) in enumerate(new_writes):
             # Replace existing write for same task + channel
             found = False
@@ -140,12 +170,14 @@ class InMemorySaver(BaseCheckpointSaver):
 
         if before:
             before_id = before.get("configurable", {}).get("checkpoint_id")
-            if before_id and before_id in ns_storage:
+            if before_id:
+                if before_id not in ns_storage:
+                    return []
                 before_ts = ns_storage[before_id].checkpoint.get("ts", "")
                 tuples = [t for t in tuples if t.checkpoint.get("ts", "") < before_ts]
 
         tuples.sort(key=lambda t: t.checkpoint.get("ts", ""), reverse=True)
-        return tuples[:limit]
+        return [self._enrich_with_writes(t) for t in tuples[:limit]]
 
     def delete_thread(self, thread_id: str) -> None:
         if thread_id in self.storage:
@@ -160,4 +192,5 @@ class InMemorySaver(BaseCheckpointSaver):
         checkpoint_id = self._get_checkpoint_id(config)
         if not checkpoint_id:
             return []
-        return self.writes.get((thread_id, checkpoint_ns, checkpoint_id), [])
+        stored = self.writes.get((thread_id, checkpoint_ns, checkpoint_id), [])
+        return [(tid, ch, copy.deepcopy(val)) for tid, ch, val in stored]

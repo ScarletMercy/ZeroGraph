@@ -80,7 +80,9 @@ class LLMStreamAdapter:
         tc_list = getattr(delta, "tool_calls", None)
         if tc_list:
             for tc_delta in tc_list:
-                idx = getattr(tc_delta, "index", len(self._tool_calls))
+                idx = getattr(tc_delta, "index", None)
+                if idx is None:
+                    idx = len(self._tool_calls)
                 fn = getattr(tc_delta, "function", None)
                 while len(self._tool_calls) <= idx:
                     self._tool_calls.append(
@@ -94,7 +96,7 @@ class LLMStreamAdapter:
                     fn_name = getattr(fn, "name", None)
                     fn_args = getattr(fn, "arguments", None)
                     if fn_name:
-                        self._tool_calls[idx]["function"]["name"] += fn_name
+                        self._tool_calls[idx]["function"]["name"] = fn_name
                     if fn_args:
                         self._tool_calls[idx]["function"]["arguments"] += fn_args
                 tc_id = getattr(tc_delta, "id", None)
@@ -117,8 +119,11 @@ class LLMStreamAdapter:
                 if getattr(delta, "type", None) == "input_json_delta":
                     idx = getattr(delta, "index", 0)
                     partial = getattr(delta, "partial_json", "")
-                    if idx < len(self._tool_calls):
-                        self._tool_calls[idx]["function"]["arguments"] += partial
+                    while len(self._tool_calls) <= idx:
+                        self._tool_calls.append(
+                            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                        )
+                    self._tool_calls[idx]["function"]["arguments"] += partial
         elif event_type == "message_start":
             msg = getattr(chunk, "message", None)
             if msg:
@@ -154,12 +159,15 @@ def stream_openai(
     Use inside a generator node for ``"messages"`` stream mode::
 
         def my_node(state):
-            yield from stream_openai(
+            result = yield from stream_openai(
                 lambda **kw: client.chat.completions.create(**kw),
                 state["messages"],
             )
+            return result
 
-    The generator yields text deltas and the return value is the state update.
+    The generator yields text deltas.  Its *return value* (captured via
+    ``result = yield from ...``) is the state update dict — you must
+    ``return result`` so the framework receives it.
     """
     adapter = LLMStreamAdapter()
     params: dict[str, Any] = {"messages": messages, "stream": True, **kwargs}

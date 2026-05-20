@@ -18,7 +18,7 @@ __all__ = ("entrypoint", "task")
 class _TaskFuture:
     """Future-like object returned by @task decorated functions."""
 
-    __slots__ = ("_func", "_args", "_kwargs", "_result", "_done")
+    __slots__ = ("_func", "_args", "_kwargs", "_result", "_done", "_exception")
 
     def __init__(self, func: Callable, args: tuple, kwargs: dict) -> None:
         self._func = func
@@ -26,20 +26,35 @@ class _TaskFuture:
         self._kwargs = kwargs
         self._result = None
         self._done = False
+        self._exception = None
 
     def result(self) -> Any:
         if not self._done:
-            self._result = self._func(*self._args, **self._kwargs)
-            self._done = True
+            try:
+                self._result = self._func(*self._args, **self._kwargs)
+                self._done = True
+            except Exception as e:
+                self._exception = e
+                self._done = True
+                raise
+        if self._exception is not None:
+            raise self._exception
         return self._result
 
     async def aresult(self) -> Any:
         if not self._done:
-            if asyncio.iscoroutinefunction(self._func):
-                self._result = await self._func(*self._args, **self._kwargs)
-            else:
-                self._result = self._func(*self._args, **self._kwargs)
-            self._done = True
+            try:
+                if asyncio.iscoroutinefunction(self._func):
+                    self._result = await self._func(*self._args, **self._kwargs)
+                else:
+                    self._result = self._func(*self._args, **self._kwargs)
+                self._done = True
+            except Exception as e:
+                self._exception = e
+                self._done = True
+                raise
+        if self._exception is not None:
+            raise self._exception
         return self._result
 
 
@@ -66,6 +81,8 @@ def _resolve_futures(obj: Any) -> Any:
         return type(obj)(resolved)
     elif isinstance(obj, dict):
         return {k: _resolve_futures(v) for k, v in obj.items()}
+    elif isinstance(obj, set):
+        return {_resolve_futures(item) for item in obj}
     return obj
 
 
@@ -78,6 +95,8 @@ async def _aresolve_futures(obj: Any) -> Any:
         return type(obj)(resolved)
     elif isinstance(obj, dict):
         return {k: await _aresolve_futures(v) for k, v in obj.items()}
+    elif isinstance(obj, set):
+        return {_aresolve_futures(item) for item in obj}
     return obj
 
 
@@ -125,12 +144,16 @@ class _EntrypointWrapper:
                 "checkpoint_ns": PREVIOUS,
             }
         }
+        try:
+            saved = copy.deepcopy(result)
+        except Exception:
+            saved = result
         from zerograph.checkpoint.base import Checkpoint, CheckpointMetadata
         cp: Checkpoint = {
             "v": 1,
             "id": str(uuid.uuid4()),
             "ts": datetime.now(timezone.utc).isoformat(),
-            "channel_values": {"__root__": copy.deepcopy(result)},
+            "channel_values": {"__root__": saved},
             "channel_versions": {"__root__": 1},
             "versions_seen": {},
         }
@@ -192,6 +215,7 @@ class _EntrypointWrapper:
 
         result = self._func(input, **kwargs)
         result = _resolve_futures(result)
+        self._save_previous(result, config)
 
         # Yield custom events first, then final result
         if stream_mode == "custom":
@@ -219,6 +243,7 @@ class _EntrypointWrapper:
         else:
             result = self._func(input, **kwargs)
         result = await _aresolve_futures(result)
+        self._save_previous(result, config)
 
         if stream_mode == "custom":
             for ev in events:

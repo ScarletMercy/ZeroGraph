@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 from typing import Any, Generic
 
@@ -37,13 +38,20 @@ class LastValue(Generic[Value], BaseChannel[Value, Value, Value]):
 
     def copy(self) -> LastValue:
         empty = self.__class__(self.typ, self.key)
-        empty.value = self.value
+        if self.value is not MISSING:
+            try:
+                empty.value = copy.deepcopy(self.value)
+            except Exception:
+                empty.value = self.value
         return empty
 
     def from_checkpoint(self, checkpoint: Value) -> LastValue:
         empty = self.__class__(self.typ, self.key)
         if checkpoint is not MISSING:
-            empty.value = checkpoint
+            try:
+                empty.value = copy.deepcopy(checkpoint)
+            except Exception:
+                empty.value = checkpoint
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:
@@ -98,11 +106,24 @@ class LastValueAfterFinish(Generic[Value], BaseChannel[Value, Value, tuple]):
             return MISSING
         return (self.value, self.finished)
 
+    def copy(self) -> LastValueAfterFinish:
+        empty = self.__class__(self.typ, self.key)
+        if self.value is not MISSING:
+            try:
+                empty.value = copy.deepcopy(self.value)
+            except Exception:
+                empty.value = self.value
+        empty.finished = self.finished
+        return empty
+
     def from_checkpoint(self, checkpoint) -> LastValueAfterFinish:
-        empty = self.__class__(self.typ)
-        empty.key = self.key
+        empty = self.__class__(self.typ, self.key)
         if checkpoint is not MISSING:
-            empty.value, empty.finished = checkpoint
+            try:
+                empty.value = copy.deepcopy(checkpoint[0])
+            except Exception:
+                empty.value = checkpoint[0]
+            empty.finished = checkpoint[1]
         return empty
 
     def update(self, values: Sequence) -> bool:

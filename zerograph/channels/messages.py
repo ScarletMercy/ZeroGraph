@@ -49,6 +49,7 @@ def add_messages(existing: Sequence, new_messages: Sequence) -> list:
     to_remove: set[str] = set()
     to_append: list[Any] = []
 
+    new_ids: set[str] = set()
     for msg in new_messages:
         if isinstance(msg, RemoveMessage):
             to_remove.add(msg.id)
@@ -57,9 +58,16 @@ def add_messages(existing: Sequence, new_messages: Sequence) -> list:
             if mid is not None and mid in existing_by_id:
                 # Update existing message by id
                 existing_by_id[mid] = msg
+            elif mid is not None and mid in new_ids:
+                for i in range(len(to_append) - 1, -1, -1):
+                    if _get_message_id(to_append[i]) == mid:
+                        to_append[i] = msg
+                        break
             else:
                 # New message - append
                 to_append.append(msg)
+                if mid is not None:
+                    new_ids.add(mid)
 
     # Build result: existing messages (with updates applied), minus removed, plus new
     result = []
@@ -72,7 +80,7 @@ def add_messages(existing: Sequence, new_messages: Sequence) -> list:
         else:
             result.append(msg)
 
-    result.extend(to_append)
+    result.extend([msg for msg in to_append if _get_message_id(msg) not in to_remove])
     return result
 
 

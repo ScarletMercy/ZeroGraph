@@ -372,7 +372,7 @@ class StateGraph(Generic[StateT, InputT, OutputT]):
                 rtn = hints.get("return")
                 if rtn and get_origin(rtn) is Literal:
                     path_map_ = {name: name for name in get_args(rtn)}
-            except Exception:
+            except (NameError, TypeError, AttributeError):
                 pass
 
         name = getattr(path, "__name__", "condition")

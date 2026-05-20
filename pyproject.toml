@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zerograph"
-version = "0.1.0"
+version = "0.2.0"
 description = "A lightweight graph execution engine with zero external dependencies — state management, checkpointing, streaming, and multi-agent orchestration."
 readme = "README.md"
 license = "MIT"
@@ -25,6 +25,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ScarletMercy/ZeroGraph"
+Repository = "https://github.com/ScarletMercy/ZeroGraph"
+Changelog = "https://github.com/ScarletMercy/ZeroGraph/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]

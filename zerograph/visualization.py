@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import TYPE_CHECKING
 
 from zerograph.constants import START, END
@@ -11,46 +13,51 @@ if TYPE_CHECKING:
 
 __all__ = ("get_mermaid",)
 
+_RESERVED = frozenset({START, END})
+
 
 def get_mermaid(graph: StateGraph) -> str:
     """Generate a Mermaid flowchart from a StateGraph."""
     lines = ["flowchart TD"]
 
-    # START and END nodes with special shapes
     lines.append(f'    {START}(["START"])')
     lines.append(f'    {END}(["END"])')
 
-    # All user-defined nodes
     for name in graph.nodes:
         safe_name = _safe_id(name)
-        lines.append(f'    {safe_name}["{name}"]')
+        lines.append(f'    {safe_name}["{_escape_label(name)}"]')
 
-    # Direct edges
     for start, end in graph.edges:
-        s = _safe_id(start) if start != START else START
-        e = _safe_id(end) if end != END else END
+        s = _safe_id(start) if start not in _RESERVED else start
+        e = _safe_id(end) if end not in _RESERVED else end
         lines.append(f"    {s} --> {e}")
 
-    # Conditional edges
     for source, branches in graph.branches.items():
-        s = _safe_id(source) if source != START else START
+        s = _safe_id(source) if source not in _RESERVED else source
         for name, branch in branches.items():
             if branch.ends:
                 for cond, target in branch.ends.items():
-                    t = _safe_id(target) if target != END else END
-                    lines.append(f'    {s} -->|"{cond}"| {t}')
+                    t = _safe_id(target) if target not in _RESERVED else target
+                    lines.append(f'    {s} -->|"{_escape_label(cond)}"| {t}')
 
-    # Waiting edges (fan-in)
     for starts, end in graph.waiting_edges:
-        e = _safe_id(end) if end != END else END
+        e = _safe_id(end) if end not in _RESERVED else end
         for s in starts:
-            sid = _safe_id(s) if s != START else START
+            sid = _safe_id(s) if s not in _RESERVED else s
             lines.append(f"    {sid} --> {e}")
 
     return "\n".join(lines)
 
 
+def _escape_label(name: str) -> str:
+    return (name
+        .replace('&', '&amp;')
+        .replace('"', '&quot;')
+        .replace('[', '&#91;')
+        .replace(']', '&#93;'))
+
+
 def _safe_id(name: str) -> str:
-    """Make a name safe for use as a Mermaid node ID."""
-    import re
-    return re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    base = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    h = hashlib.md5(name.encode()).hexdigest()[:6]
+    return f"{base}_{h}"

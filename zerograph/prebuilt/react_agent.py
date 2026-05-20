@@ -55,19 +55,23 @@ def create_react_agent(
     graph = StateGraph(state_schema)
 
     def agent_node(state: dict) -> dict:
-        response = llm_callable(state["messages"], tools=tools_schema)
+        response = llm_callable(state.get("messages", []), tools=tools_schema)
         return {"messages": [response]}
 
     def should_continue(state: dict) -> str:
         messages = state.get("messages", [])
-        # Count agent turns (every 2 messages = 1 agent turn: agent+tool or agent+user)
-        agent_turns = sum(1 for m in messages if m.get("role") == "assistant")
-        if agent_turns >= max_iterations:
-            return END
         last = messages[-1] if messages else {}
-        if last.get("tool_calls"):
-            return "tools"
-        return END
+        if not last.get("tool_calls"):
+            return END
+        recent = []
+        for m in reversed(messages):
+            recent.insert(0, m)
+            if m.get("role") == "user":
+                break
+        agent_turns = sum(1 for m in recent if m.get("role") == "assistant")
+        if agent_turns > max_iterations:
+            return END
+        return "tools"
 
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tool_node)

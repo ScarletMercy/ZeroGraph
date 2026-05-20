@@ -35,10 +35,23 @@ class BaseCache(ABC):
 
 
 class InMemoryCache(BaseCache):
-    """In-memory cache with TTL support."""
+    """In-memory cache with TTL support and size limit."""
 
-    def __init__(self) -> None:
+    def __init__(self, maxsize: int = 256) -> None:
         self._store: dict[str, tuple[Any, float | None]] = {}
+        self._maxsize = maxsize
+
+    def _evict(self) -> None:
+        if not self._store:
+            return
+        now = time.monotonic()
+        expired = [k for k, (_, exp) in self._store.items() if exp is not None and now > exp]
+        if expired:
+            for k in expired:
+                del self._store[k]
+            return
+        oldest = next(iter(self._store))
+        del self._store[oldest]
 
     def get(self, key: str) -> Any | None:
         entry = self._store.get(key)
@@ -51,6 +64,10 @@ class InMemoryCache(BaseCache):
         return value
 
     def set(self, key: str, value: Any, ttl: float | None = None) -> None:
+        if self._maxsize <= 0:
+            return
+        if key not in self._store and len(self._store) >= self._maxsize:
+            self._evict()
         expires_at = None
         if ttl is not None:
             expires_at = time.monotonic() + ttl

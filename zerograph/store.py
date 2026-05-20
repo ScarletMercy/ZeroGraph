@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -58,13 +59,14 @@ class InMemoryStore(BaseStore):
         ns = self._data.get(namespace)
         if ns is None:
             return None
-        return ns.get(key)
+        item = ns.get(key)
+        return copy.deepcopy(item) if item is not None else None
 
     def search(self, namespace: str, *, prefix: str = "",
                limit: int = 10) -> list[StoreItem]:
         ns = self._data.get(namespace, {})
         items = [
-            item for key, item in ns.items()
+            copy.deepcopy(item) for key, item in ns.items()
             if key.startswith(prefix)
         ]
         items.sort(key=lambda x: x.updated_at, reverse=True)
@@ -76,8 +78,10 @@ class InMemoryStore(BaseStore):
             self._data[namespace] = {}
         existing = self._data[namespace].get(key)
         if existing is not None:
-            existing.value = value
-            existing.updated_at = now
+            self._data[namespace][key] = StoreItem(
+                key=key, value=value, namespace=namespace,
+                created_at=existing.created_at, updated_at=now,
+            )
         else:
             self._data[namespace][key] = StoreItem(
                 key=key, value=value, namespace=namespace,

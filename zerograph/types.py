@@ -70,7 +70,10 @@ class Interrupt:
         )
 
     def __hash__(self) -> int:
-        return hash((self.value, self.id))
+        try:
+            return hash((self.value, self.id))
+        except TypeError:
+            return hash((self.id,))
 
     @classmethod
     def from_ns(cls, value: Any, ns: str) -> Interrupt:
@@ -98,7 +101,10 @@ class Send:
         self.timeout = timeout
 
     def __hash__(self) -> int:
-        return hash((self.node,))
+        try:
+            return hash((self.node, self.arg))
+        except TypeError:
+            return hash((self.node,))
 
     def __repr__(self) -> str:
         return f"Send(node={self.node!r}, arg={self.arg!r})"

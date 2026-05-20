@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import inspect
 import itertools
+import random
 import threading
 import time
 import uuid
@@ -30,6 +32,7 @@ from zerograph.constants import (
     CONFIG_KEY_WRITER,
     END,
     INTERRUPT,
+    MAX_SEND_DEPTH,
     NULL_TASK_ID,
     RESUME,
     START,
@@ -51,7 +54,7 @@ from zerograph.types import (
     StateSnapshot,
 )
 
-_current_config: ContextVar[dict] = ContextVar("_current_config", default={})
+_current_config: ContextVar[dict] = ContextVar("_current_config")
 
 __all__ = ("PregelLoop",)
 
@@ -77,8 +80,8 @@ class Scratchpad:
     def __init__(self, *, step=0, stop=25, resume=None, get_null_resume=None):
         self.step = step
         self.stop = stop
-        self.resume = resume or []
-        self.get_null_resume = get_null_resume or (lambda consume=False: None)
+        self.resume = [] if resume is None else list(resume)
+        self.get_null_resume = get_null_resume if get_null_resume is not None else (lambda consume=False: None)
         self.interrupt_counter = _LazyAtomicCounter()
         self.call_counter = _LazyAtomicCounter()
 
@@ -105,6 +108,7 @@ class PregelLoop:
         self.output_channels = output_channels
         self.stream_channels = stream_channels
         self.checkpointer = checkpointer
+        self._subgraph_lock = threading.Lock()
         self.interrupt_before = interrupt_before_nodes or []
         self.interrupt_after = interrupt_after_nodes or []
         self.context = context
@@ -416,7 +420,7 @@ class PregelLoop:
         self._save_checkpoint(config, checkpoint)
 
         last_event = None
-        completed_nodes: set[str] = set()
+        completed_nodes: set[str] = set(checkpoint.get("_completed_nodes", []))
 
         for step in range(recursion_limit + 1):
             if step >= recursion_limit:
@@ -446,16 +450,16 @@ class PregelLoop:
                 if nodes_to_interrupt:
                     checkpoint = self._checkpoint_from_channels(channels, checkpoint)
                     checkpoint["_next_nodes"] = next_nodes
+                    checkpoint["_completed_nodes"] = list(completed_nodes)
                     self._save_checkpoint(config, checkpoint)
                     if "values" in modes:
                         val = self._read_output(channels)
                         yield ("values", val) if is_multi else val
                     return
-
-            # Execute nodes
             updates = {}
             new_next = set()
             new_sends: list[Send] = []
+            prev_completed = set(completed_nodes)
 
             for node_name in next_nodes:
                 if node_name not in builder.nodes:
@@ -516,12 +520,13 @@ class PregelLoop:
                             result_updates = self._process_result(result, channels)
                             if result_updates and "updates" in modes:
                                 updates.setdefault(node_name, {}).update(result_updates)
-                            if isinstance(result, Send):
-                                new_sends.append(result)
-                            elif isinstance(result, (list, tuple)):
-                                for item in result:
-                                    if isinstance(item, Send):
-                                        new_sends.append(item)
+                            if node_name not in builder.branches:
+                                if isinstance(result, Send):
+                                    new_sends.append(result)
+                                elif isinstance(result, (list, tuple)):
+                                    for item in result:
+                                        if isinstance(item, Send):
+                                            new_sends.append(item)
 
                     # Yield custom writer events
                     if "custom" in modes and send_custom_events:
@@ -533,7 +538,14 @@ class PregelLoop:
                         new_next.update(node_next)
                         new_sends.extend(extra_sends)
                     elif send_errors:
-                        raise send_errors[-1]
+                        if node_spec.error_handler_node:
+                            error_val = {"node": node_name, "error": str(send_errors[-1])}
+                            if "__error__" in channels:
+                                channels["__error__"].update([error_val])
+                            new_next.add(node_spec.error_handler_node)
+                            completed_nodes.add(node_name)
+                        else:
+                            raise send_errors[-1]
                     continue
 
                 # Regular node execution
@@ -604,7 +616,18 @@ class PregelLoop:
                                 chunk = next(gen)
                                 yield ("messages", {"node": node_name, "chunk": chunk}) if is_multi else {"node": node_name, "chunk": chunk}
                         except StopIteration as e:
-                            result = e.value
+                            result = getattr(e, 'value', None)
+                    elif is_gen:
+                        # Exhaust generator without streaming
+                        needs_conf = self._func_needs_config(node_func)
+                        args = (node_input, task_config) if needs_conf else (node_input,)
+                        gen = node_func(*args)
+                        result = None
+                        try:
+                            while True:
+                                next(gen)
+                        except StopIteration as e:
+                            result = getattr(e, 'value', None)
                     else:
                         result = self._call_node(
                             node_func, node_input,
@@ -615,6 +638,7 @@ class PregelLoop:
                     _current_config.reset(token)
                     checkpoint = self._checkpoint_from_channels(channels, checkpoint)
                     checkpoint["_next_nodes"] = (node_name,)
+                    checkpoint["_completed_nodes"] = list(completed_nodes)
                     for interrupt_val in gi.interrupts:
                         self._save_interrupt(config, checkpoint, interrupt_val)
                     if "values" in modes:
@@ -627,7 +651,7 @@ class PregelLoop:
                 except Exception as e:
                     _current_config.reset(token)
                     if node_spec.error_handler_node:
-                        error_val = {"node": node_name, "error": str(e)}
+                        error_val = {"node": node_name, "error": str(e), "error_type": type(e).__name__}
                         if "__error__" in channels:
                             channels["__error__"].update([error_val])
                         new_next.add(node_spec.error_handler_node)
@@ -679,92 +703,113 @@ class PregelLoop:
                 new_sends.extend(extra_sends)
 
             # Process new sends from this step (with nested Send support)
-            i = 0
-            while i < len(new_sends):
-                send = new_sends[i]
-                i += 1
-                if send.node in builder.nodes:
-                    node_spec = builder.nodes[send.node]
-                    # Build proper task config for the Send-target node
-                    send_scratchpad = Scratchpad(
-                        step=step, stop=recursion_limit,
-                        resume=[resume_value] if resume_value is not None else None
+            # Sends are processed in batches to track nesting depth correctly
+            send_batch_start = 0
+            send_depth = 0
+            while send_batch_start < len(new_sends):
+                send_depth += 1
+                if send_depth > MAX_SEND_DEPTH:
+                    raise GraphRecursionError(
+                        f"Send chain depth limit of {MAX_SEND_DEPTH} reached"
                     )
-                    send_custom_events: list = []
-                    send_custom_writer = None
-                    if "custom" in modes:
-                        def _make_send_writer(n):
-                            def writer(value):
-                                send_custom_events.append((n, value))
-                            return writer
-                        send_custom_writer = _make_send_writer(send.node)
-                    send_config = self._make_task_config(
-                        config, send.node, channels, send_scratchpad,
-                        custom_writer=send_custom_writer,
-                    )
-                    send_token = _current_config.set(send_config)
-                    try:
-                        # Check cache for send-target
-                        cache_key = self._get_cache_key(
-                            send.node, send.arg, node_spec.cache_policy
+                send_batch_end = len(new_sends)
+                for i in range(send_batch_start, send_batch_end):
+                    send = new_sends[i]
+                    if send.node in builder.nodes:
+                        node_spec = builder.nodes[send.node]
+                        # Build proper task config for the Send-target node
+                        send_scratchpad = Scratchpad(
+                            step=step, stop=recursion_limit,
+                            resume=[resume_value] if resume_value is not None else None
                         )
-                        cached = self._check_cache(cache_key, node_spec.cache_policy)
-                        if cached is not None:
-                            result = cached
-                        else:
-                            result = self._call_node(
-                                node_spec.runnable, send.arg,
-                                retry_policy=node_spec.retry_policy,
-                                timeout=node_spec.timeout.run_timeout if node_spec.timeout else None,
+                        send_custom_events: list = []
+                        send_custom_writer = None
+                        if "custom" in modes:
+                            def _make_send_writer(n):
+                                def writer(value):
+                                    send_custom_events.append((n, value))
+                                return writer
+                            send_custom_writer = _make_send_writer(send.node)
+                        send_config = self._make_task_config(
+                            config, send.node, channels, send_scratchpad,
+                            custom_writer=send_custom_writer,
+                        )
+                        send_token = _current_config.set(send_config)
+                        try:
+                            # Check cache for send-target
+                            cache_key = self._get_cache_key(
+                                send.node, send.arg, node_spec.cache_policy
                             )
-                            if cache_key is not None and result is not None:
-                                self._store_cache(cache_key, node_spec.cache_policy, result)
-                    except GraphBubbleUp:
+                            cached = self._check_cache(cache_key, node_spec.cache_policy)
+                            if cached is not None:
+                                result = cached
+                            else:
+                                result = self._call_node(
+                                    node_spec.runnable, send.arg,
+                                    retry_policy=node_spec.retry_policy,
+                                    timeout=node_spec.timeout.run_timeout if node_spec.timeout else None,
+                                )
+                                if cache_key is not None and result is not None:
+                                    self._store_cache(cache_key, node_spec.cache_policy, result)
+                        except GraphBubbleUp:
+                            _current_config.reset(send_token)
+                            raise
+                        except Exception as send_err:
+                            _current_config.reset(send_token)
+                            # Propagate Send errors instead of silently swallowing
+                            if node_spec.error_handler_node:
+                                error_val = {"node": send.node, "error": str(send_err)}
+                                if "__error__" in channels:
+                                    channels["__error__"].update([error_val])
+                                new_next.add(node_spec.error_handler_node)
+                                completed_nodes.add(send.node)
+                                continue
+                            raise
                         _current_config.reset(send_token)
-                        raise
-                    except Exception as send_err:
-                        _current_config.reset(send_token)
-                        # Propagate Send errors instead of silently swallowing
-                        if node_spec.error_handler_node:
-                            error_val = {"node": send.node, "error": str(send_err)}
-                            if "__error__" in channels:
-                                channels["__error__"].update([error_val])
-                            new_next.add(node_spec.error_handler_node)
-                            completed_nodes.add(send.node)
-                            continue
-                        raise
-                    _current_config.reset(send_token)
 
-                    # Yield custom writer events
-                    if "custom" in modes and send_custom_events:
-                        for cn, cv in send_custom_events:
-                            yield ("custom", {"node": cn, "value": cv}) if is_multi else {"node": cn, "value": cv}
+                        # Yield custom writer events
+                        if "custom" in modes and send_custom_events:
+                            for cn, cv in send_custom_events:
+                                yield ("custom", {"node": cn, "value": cv}) if is_multi else {"node": cn, "value": cv}
 
-                    if result is not None:
-                        result_updates = self._process_result(result, channels)
-                        if result_updates and "updates" in modes:
-                            updates.setdefault(send.node, {}).update(result_updates)
-                        if isinstance(result, Send):
-                            new_sends.append(result)
-                        elif isinstance(result, (list, tuple)):
-                            for item in result:
-                                if isinstance(item, Send):
-                                    new_sends.append(item)
-                    completed_nodes.add(send.node)
-                    node_next, extra_sends = self._get_next_nodes(builder, send.node, result, channels)
-                    new_next.update(node_next)
-                    new_sends.extend(extra_sends)
+                        if result is not None:
+                            result_updates = self._process_result(result, channels)
+                            if result_updates and "updates" in modes:
+                                updates.setdefault(send.node, {}).update(result_updates)
+                            if send.node not in builder.branches:
+                                if isinstance(result, Send):
+                                    new_sends.append(result)
+                                elif isinstance(result, (list, tuple)):
+                                    for item in result:
+                                        if isinstance(item, Send):
+                                            new_sends.append(item)
+                        completed_nodes.add(send.node)
+                        node_next, extra_sends = self._get_next_nodes(builder, send.node, result, channels)
+                        new_next.update(node_next)
+                        new_sends.extend(extra_sends)
+                send_batch_start = send_batch_end
 
-            # Check interrupt_after
+            # Check waiting edges before saving so they're included in _next_nodes
+            waiting_next = set()
+            for starts, end in builder.waiting_edges:
+                if (end not in new_next
+                    and end not in completed_nodes
+                    and all(s in completed_nodes for s in starts)):
+                    if end != END:
+                        waiting_next.add(end)
+
+            # Check interrupt_after (includes Send-triggered nodes)
             if self.interrupt_after:
+                step_executed = completed_nodes - prev_completed
                 nodes_to_interrupt = [
-                    n for n in next_nodes
+                    n for n in step_executed
                     if ("*" in self.interrupt_after or n in self.interrupt_after)
                     and n in builder.nodes
                 ]
                 if nodes_to_interrupt:
                     checkpoint = self._checkpoint_from_channels(channels, checkpoint)
-                    checkpoint["_next_nodes"] = list(new_next)
+                    checkpoint["_next_nodes"] = list(new_next | waiting_next)
+                    checkpoint["_completed_nodes"] = list(completed_nodes)
                     self._save_checkpoint(config, checkpoint)
                     if "values" in modes:
                         val = self._read_output(channels)
@@ -776,8 +821,9 @@ class PregelLoop:
 
             # Save checkpoint
             checkpoint = self._checkpoint_from_channels(channels, checkpoint)
-            checkpoint["_next_nodes"] = list(new_next)
+            checkpoint["_next_nodes"] = list(new_next | waiting_next)
             checkpoint["_step"] = step + 1
+            checkpoint["_completed_nodes"] = list(completed_nodes)
             self._save_checkpoint(config, checkpoint)
 
             # Yield events
@@ -791,17 +837,8 @@ class PregelLoop:
                 if updates:
                     yield ("updates", updates) if is_multi else updates
             if "debug" in modes:
-                dbg_ev = {"type": "step_end", "step": step, "next_nodes": list(new_next)}
+                dbg_ev = {"type": "step_end", "step": step, "next_nodes": list(new_next | waiting_next)}
                 yield ("debug", dbg_ev) if is_multi else dbg_ev
-
-            # After executing all nodes, check waiting edges for next step
-            waiting_next = set()
-            for starts, end in builder.waiting_edges:
-                if (end not in new_next
-                    and end not in completed_nodes
-                    and all(s in completed_nodes for s in starts)):
-                    if end != END:
-                        waiting_next.add(end)
 
             next_nodes = list(new_next | waiting_next)
 
@@ -872,7 +909,7 @@ class PregelLoop:
         self._save_checkpoint(config, checkpoint)
 
         last_event = None
-        completed_nodes: set[str] = set()
+        completed_nodes: set[str] = set(checkpoint.get("_completed_nodes", []))
 
         for step in range(recursion_limit + 1):
             if step >= recursion_limit:
@@ -900,6 +937,7 @@ class PregelLoop:
                 if nodes_to_interrupt:
                     checkpoint = self._checkpoint_from_channels(channels, checkpoint)
                     checkpoint["_next_nodes"] = next_nodes
+                    checkpoint["_completed_nodes"] = list(completed_nodes)
                     self._save_checkpoint(config, checkpoint)
                     if "values" in modes:
                         val = self._read_output(channels)
@@ -909,6 +947,7 @@ class PregelLoop:
             updates = {}
             new_next = set()
             new_sends = []
+            prev_completed = set(completed_nodes)
 
             # Use parallel execution when max_concurrency > 1 and no streaming modes
             # that require sequential yield (messages, custom).
@@ -917,7 +956,13 @@ class PregelLoop:
                 max_concurrency > 1
                 and len(next_nodes) > 1
                 and "messages" not in modes
+                and "debug" not in modes
                 and not any(n in send_inputs for n in next_nodes)
+                and not any(
+                    inspect.isgeneratorfunction(builder.nodes[n].runnable)
+                    or inspect.isasyncgenfunction(builder.nodes[n].runnable)
+                    for n in next_nodes
+                )
             )
 
             if can_parallel:
@@ -931,21 +976,27 @@ class PregelLoop:
                 new_sends = par_new_sends
                 for ev in par_events:
                     yield ev if is_multi else ev[1]
-                # Mark completed nodes
+                # Mark completed nodes (skip nodes that were never executed)
                 for nn in par_results:
-                    if par_results[nn].get("error") is None or par_results[nn].get("new_next"):
+                    r = par_results[nn]
+                    if r.get("skipped"):
+                        continue
+                    if r.get("error") is None or r.get("new_next"):
                         completed_nodes.add(nn)
                 # Check for interrupts
                 for nn in par_results:
-                    if par_results[nn].get("error") == "interrupt":
+                    r = par_results[nn]
+                    if r.get("error") == "interrupt":
                         checkpoint = self._checkpoint_from_channels(channels, checkpoint)
                         checkpoint["_next_nodes"] = (nn,)
-                        self._save_interrupt(config, checkpoint, None)
+                        checkpoint["_completed_nodes"] = list(completed_nodes)
+                        for interrupt_val in r.get("interrupts", ()):
+                            self._save_interrupt(config, checkpoint, interrupt_val)
                         if "values" in modes:
                             yield ("values", self._read_output(channels)) if is_multi else self._read_output(channels)
                         return
-                    if isinstance(par_results[nn].get("error"), Exception):
-                        raise par_results[nn]["error"]
+                    if isinstance(r.get("error"), Exception):
+                        raise r["error"]
 
             for node_name in next_nodes:
                 if can_parallel:
@@ -1005,12 +1056,13 @@ class PregelLoop:
                             result_updates = self._process_result(result, channels)
                             if result_updates and "updates" in modes:
                                 updates.setdefault(node_name, {}).update(result_updates)
-                            if isinstance(result, Send):
-                                new_sends.append(result)
-                            elif isinstance(result, (list, tuple)):
-                                for item in result:
-                                    if isinstance(item, Send):
-                                        new_sends.append(item)
+                            if node_name not in builder.branches:
+                                if isinstance(result, Send):
+                                    new_sends.append(result)
+                                elif isinstance(result, (list, tuple)):
+                                    for item in result:
+                                        if isinstance(item, Send):
+                                            new_sends.append(item)
 
                     # Yield custom writer events
                     if "custom" in modes and send_custom_events:
@@ -1022,7 +1074,14 @@ class PregelLoop:
                         new_next.update(node_next)
                         new_sends.extend(extra_sends)
                     elif send_errors:
-                        raise send_errors[-1]
+                        if node_spec.error_handler_node:
+                            error_val = {"node": node_name, "error": str(send_errors[-1])}
+                            if "__error__" in channels:
+                                channels["__error__"].update([error_val])
+                            new_next.add(node_spec.error_handler_node)
+                            completed_nodes.add(node_name)
+                        else:
+                            raise send_errors[-1]
                     continue
 
                 try:
@@ -1091,7 +1150,18 @@ class PregelLoop:
                                 chunk = await gen.__anext__()
                                 yield ("messages", {"node": node_name, "chunk": chunk}) if is_multi else {"node": node_name, "chunk": chunk}
                         except StopAsyncIteration as e:
-                            result = e.value
+                            result = getattr(e, 'value', None)
+                    elif is_async_gen:
+                        # Exhaust async generator without streaming
+                        needs_conf = self._func_needs_config(node_func)
+                        args = (node_input, task_config) if needs_conf else (node_input,)
+                        gen = node_func(*args)
+                        result = None
+                        try:
+                            while True:
+                                await gen.__anext__()
+                        except StopAsyncIteration as e:
+                            result = getattr(e, 'value', None)
                     elif is_sync_gen and "messages" in modes:
                         # Sync generator in async context
                         needs_conf = self._func_needs_config(node_func)
@@ -1103,7 +1173,18 @@ class PregelLoop:
                                 chunk = next(gen)
                                 yield ("messages", {"node": node_name, "chunk": chunk}) if is_multi else {"node": node_name, "chunk": chunk}
                         except StopIteration as e:
-                            result = e.value
+                            result = getattr(e, 'value', None)
+                    elif is_sync_gen:
+                        # Exhaust sync generator without streaming
+                        needs_conf = self._func_needs_config(node_func)
+                        args = (node_input, task_config) if needs_conf else (node_input,)
+                        gen = node_func(*args)
+                        result = None
+                        try:
+                            while True:
+                                next(gen)
+                        except StopIteration as e:
+                            result = getattr(e, 'value', None)
                     else:
                         result = await self._acall_node(
                             node_func, node_input,
@@ -1114,6 +1195,7 @@ class PregelLoop:
                     _current_config.reset(token)
                     checkpoint = self._checkpoint_from_channels(channels, checkpoint)
                     checkpoint["_next_nodes"] = (node_name,)
+                    checkpoint["_completed_nodes"] = list(completed_nodes)
                     for interrupt_val in gi.interrupts:
                         self._save_interrupt(config, checkpoint, interrupt_val)
                     if "values" in modes:
@@ -1126,7 +1208,7 @@ class PregelLoop:
                 except Exception as e:
                     _current_config.reset(token)
                     if node_spec.error_handler_node:
-                        error_val = {"node": node_name, "error": str(e)}
+                        error_val = {"node": node_name, "error": str(e), "error_type": type(e).__name__}
                         if "__error__" in channels:
                             channels["__error__"].update([error_val])
                         new_next.add(node_spec.error_handler_node)
@@ -1172,88 +1254,108 @@ class PregelLoop:
                 new_sends.extend(extra_sends)
 
             # Process new sends (with nested Send support)
-            i = 0
-            while i < len(new_sends):
-                send = new_sends[i]
-                i += 1
-                if send.node in builder.nodes:
-                    node_spec = builder.nodes[send.node]
-                    send_scratchpad = Scratchpad(
-                        step=step, stop=recursion_limit,
-                        resume=[resume_value] if resume_value is not None else None
+            send_batch_start = 0
+            send_depth = 0
+            while send_batch_start < len(new_sends):
+                send_depth += 1
+                if send_depth > MAX_SEND_DEPTH:
+                    raise GraphRecursionError(
+                        f"Send chain depth limit of {MAX_SEND_DEPTH} reached"
                     )
-                    send_custom_events: list = []
-                    send_custom_writer = None
-                    if "custom" in modes:
-                        def _make_send_writer(n):
-                            def writer(value):
-                                send_custom_events.append((n, value))
-                            return writer
-                        send_custom_writer = _make_send_writer(send.node)
-                    send_config = self._make_task_config(
-                        config, send.node, channels, send_scratchpad,
-                        custom_writer=send_custom_writer,
-                    )
-                    send_token = _current_config.set(send_config)
-                    try:
-                        cache_key = self._get_cache_key(
-                            send.node, send.arg, node_spec.cache_policy
+                send_batch_end = len(new_sends)
+                for i in range(send_batch_start, send_batch_end):
+                    send = new_sends[i]
+                    if send.node in builder.nodes:
+                        node_spec = builder.nodes[send.node]
+                        send_scratchpad = Scratchpad(
+                            step=step, stop=recursion_limit,
+                            resume=[resume_value] if resume_value is not None else None
                         )
-                        cached = self._check_cache(cache_key, node_spec.cache_policy)
-                        if cached is not None:
-                            result = cached
-                        else:
-                            result = await self._acall_node(
-                                node_spec.runnable, send.arg,
-                                retry_policy=node_spec.retry_policy,
-                                timeout=node_spec.timeout.run_timeout if node_spec.timeout else None,
+                        send_custom_events: list = []
+                        send_custom_writer = None
+                        if "custom" in modes:
+                            def _make_send_writer(n):
+                                def writer(value):
+                                    send_custom_events.append((n, value))
+                                return writer
+                            send_custom_writer = _make_send_writer(send.node)
+                        send_config = self._make_task_config(
+                            config, send.node, channels, send_scratchpad,
+                            custom_writer=send_custom_writer,
+                        )
+                        send_token = _current_config.set(send_config)
+                        try:
+                            cache_key = self._get_cache_key(
+                                send.node, send.arg, node_spec.cache_policy
                             )
-                            if cache_key is not None and result is not None:
-                                self._store_cache(cache_key, node_spec.cache_policy, result)
-                    except GraphBubbleUp:
+                            cached = self._check_cache(cache_key, node_spec.cache_policy)
+                            if cached is not None:
+                                result = cached
+                            else:
+                                result = await self._acall_node(
+                                    node_spec.runnable, send.arg,
+                                    retry_policy=node_spec.retry_policy,
+                                    timeout=node_spec.timeout.run_timeout if node_spec.timeout else None,
+                                )
+                                if cache_key is not None and result is not None:
+                                    self._store_cache(cache_key, node_spec.cache_policy, result)
+                        except GraphBubbleUp:
+                            _current_config.reset(send_token)
+                            raise
+                        except Exception as send_err:
+                            _current_config.reset(send_token)
+                            if node_spec.error_handler_node:
+                                error_val = {"node": send.node, "error": str(send_err)}
+                                if "__error__" in channels:
+                                    channels["__error__"].update([error_val])
+                                new_next.add(node_spec.error_handler_node)
+                                completed_nodes.add(send.node)
+                                continue
+                            raise
                         _current_config.reset(send_token)
-                        raise
-                    except Exception as send_err:
-                        _current_config.reset(send_token)
-                        if node_spec.error_handler_node:
-                            error_val = {"node": send.node, "error": str(send_err)}
-                            if "__error__" in channels:
-                                channels["__error__"].update([error_val])
-                            new_next.add(node_spec.error_handler_node)
-                            completed_nodes.add(send.node)
-                            continue
-                        raise
-                    _current_config.reset(send_token)
 
-                    if "custom" in modes and send_custom_events:
-                        for cn, cv in send_custom_events:
-                            yield ("custom", {"node": cn, "value": cv}) if is_multi else {"node": cn, "value": cv}
+                        if "custom" in modes and send_custom_events:
+                            for cn, cv in send_custom_events:
+                                yield ("custom", {"node": cn, "value": cv}) if is_multi else {"node": cn, "value": cv}
 
-                    if result is not None:
-                        result_updates = self._process_result(result, channels)
-                        if result_updates and "updates" in modes:
-                            updates.setdefault(send.node, {}).update(result_updates)
-                        if isinstance(result, Send):
-                            new_sends.append(result)
-                        elif isinstance(result, (list, tuple)):
-                            for item in result:
-                                if isinstance(item, Send):
-                                    new_sends.append(item)
-                    completed_nodes.add(send.node)
-                    node_next, extra_sends = self._get_next_nodes(builder, send.node, result, channels)
-                    new_next.update(node_next)
-                    new_sends.extend(extra_sends)
+                        if result is not None:
+                            result_updates = self._process_result(result, channels)
+                            if result_updates and "updates" in modes:
+                                updates.setdefault(send.node, {}).update(result_updates)
+                            if send.node not in builder.branches:
+                                if isinstance(result, Send):
+                                    new_sends.append(result)
+                                elif isinstance(result, (list, tuple)):
+                                    for item in result:
+                                        if isinstance(item, Send):
+                                            new_sends.append(item)
+                        completed_nodes.add(send.node)
+                        node_next, extra_sends = self._get_next_nodes(builder, send.node, result, channels)
+                        new_next.update(node_next)
+                        new_sends.extend(extra_sends)
+                send_batch_start = send_batch_end
 
-            # Check interrupt_after
+            # Check waiting edges before saving so they're included in _next_nodes
+            waiting_next = set()
+            for starts, end in builder.waiting_edges:
+                if (end not in new_next
+                    and end not in completed_nodes
+                    and all(s in completed_nodes for s in starts)):
+                    if end != END:
+                        waiting_next.add(end)
+
+            # Check interrupt_after (includes Send-triggered nodes)
             if self.interrupt_after:
+                step_executed = completed_nodes - prev_completed
                 nodes_to_interrupt = [
-                    n for n in next_nodes
+                    n for n in step_executed
                     if ("*" in self.interrupt_after or n in self.interrupt_after)
                     and n in builder.nodes
                 ]
                 if nodes_to_interrupt:
                     checkpoint = self._checkpoint_from_channels(channels, checkpoint)
-                    checkpoint["_next_nodes"] = list(new_next)
+                    checkpoint["_next_nodes"] = list(new_next | waiting_next)
+                    checkpoint["_completed_nodes"] = list(completed_nodes)
                     self._save_checkpoint(config, checkpoint)
                     if "values" in modes:
                         val = self._read_output(channels)
@@ -1265,8 +1367,9 @@ class PregelLoop:
 
             # Save checkpoint
             checkpoint = self._checkpoint_from_channels(channels, checkpoint)
-            checkpoint["_next_nodes"] = list(new_next)
+            checkpoint["_next_nodes"] = list(new_next | waiting_next)
             checkpoint["_step"] = step + 1
+            checkpoint["_completed_nodes"] = list(completed_nodes)
             self._save_checkpoint(config, checkpoint)
 
             if "checkpoints" in modes:
@@ -1279,17 +1382,8 @@ class PregelLoop:
                 if updates:
                     yield ("updates", updates) if is_multi else updates
             if "debug" in modes:
-                dbg_ev = {"type": "step_end", "step": step, "next_nodes": list(new_next)}
+                dbg_ev = {"type": "step_end", "step": step, "next_nodes": list(new_next | waiting_next)}
                 yield ("debug", dbg_ev) if is_multi else dbg_ev
-
-            # After executing all nodes, check waiting edges for next step
-            waiting_next = set()
-            for starts, end in builder.waiting_edges:
-                if (end not in new_next
-                    and end not in completed_nodes
-                    and all(s in completed_nodes for s in starts)):
-                    if end != END:
-                        waiting_next.add(end)
 
             next_nodes = list(new_next | waiting_next)
 
@@ -1334,6 +1428,7 @@ class PregelLoop:
                 "new_sends": [],
                 "error": None,
                 "custom_events": [],
+                "skipped": False,
             }
 
             async with sem:
@@ -1341,10 +1436,12 @@ class PregelLoop:
                 try:
                     node_input = self._read_node_input(channels, node_spec, builder)
                 except EmptyChannelError:
+                    result_info["skipped"] = True
                     return result_info
                 except Exception:
                     if node_spec.error_handler_node:
-                        result_info["error"] = "input read failed"
+                        result_info["error_handler_node"] = node_spec.error_handler_node
+                        result_info["error_val"] = {"node": node_name, "error": "input read failed"}
                         result_info["new_next"] = {node_spec.error_handler_node}
                         return result_info
                     raise
@@ -1386,15 +1483,19 @@ class PregelLoop:
                         retry_policy=node_spec.retry_policy,
                         timeout=node_spec.timeout.run_timeout if node_spec.timeout else None,
                     )
-                except GraphInterrupt:
+                except GraphInterrupt as gi:
                     _current_config.reset(token)
                     result_info["error"] = "interrupt"
+                    result_info["interrupts"] = gi.interrupts
                     return result_info
+                except GraphBubbleUp:
+                    _current_config.reset(token)
+                    raise
                 except Exception as e:
                     _current_config.reset(token)
                     if node_spec.error_handler_node:
                         result_info["error_handler_node"] = node_spec.error_handler_node
-                        result_info["error_val"] = {"node": node_name, "error": str(e)}
+                        result_info["error_val"] = {"node": node_name, "error": str(e), "error_type": type(e).__name__}
                         result_info["new_next"].add(node_spec.error_handler_node)
                         return result_info
                     result_info["error"] = e
@@ -1409,7 +1510,7 @@ class PregelLoop:
                 result_info["result"] = result
                 result_info["custom_events"] = custom_events_list
 
-                if result is not None:
+                if result is not None and node_name not in builder.branches:
                     if isinstance(result, Send):
                         result_info["new_sends"].append(result)
                     elif isinstance(result, (list, tuple)):
@@ -1426,12 +1527,16 @@ class PregelLoop:
         tasks = [asyncio.create_task(run_single(n)) for n in runnable_nodes]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results sequentially — apply to shared channels here
+        # Process results sequentially — collect all updates first, then apply
         all_updates = {}
         all_new_next: set[str] = set()
         all_new_sends: list[Send] = []
         all_events: list = []
         results_by_node: dict = {}
+
+        # Phase 1: collect results without mutating channels
+        pending_channel_writes: list[tuple[str, Any]] = []
+        pending_error_writes: list[Any] = []
 
         for r in results:
             if isinstance(r, Exception):
@@ -1440,35 +1545,49 @@ class PregelLoop:
             node_name = r["node"]
             results_by_node[node_name] = r
 
-            # Task events
             if "tasks" in modes:
                 all_events.append(("tasks", {"type": "task_start", "step": step, "node": node_name}))
 
-            # Apply error handler writes to channels
             if r.get("error_handler_node") and r.get("error_val"):
-                if "__error__" in channels:
-                    channels["__error__"].update([r["error_val"]])
+                pending_error_writes.append(r["error_val"])
 
-            # Apply result to channels
             if r["result"] is not None and r["error"] is None:
                 try:
-                    result_updates = self._process_result(r["result"], channels)
+                    result_updates = self._compute_updates(r["result"], channels)
                 except GraphBubbleUp:
                     raise
                 if result_updates and "updates" in modes:
-                    all_updates[node_name] = result_updates
+                    filtered = {k: v for k, v in result_updates.items() if not isinstance(v, Overwrite)}
+                    if filtered:
+                        all_updates[node_name] = filtered
+                for key, val in result_updates.items() if result_updates else []:
+                    if key in channels:
+                        pending_channel_writes.append((key, val))
 
-            # Custom events
             if "custom" in modes and r.get("custom_events"):
                 for cn, cv in r["custom_events"]:
                     all_events.append(("custom", {"node": cn, "value": cv}))
 
-            # Task end event
             if "tasks" in modes:
                 all_events.append(("tasks", {"type": "task_end", "step": step, "node": node_name}))
 
             all_new_next.update(r["new_next"])
             all_new_sends.extend(r["new_sends"])
+
+        # Phase 2: apply all writes to channels atomically
+        for err_val in pending_error_writes:
+            if "__error__" in channels:
+                channels["__error__"].update([err_val])
+        for key, val in pending_channel_writes:
+            if key in channels:
+                if isinstance(val, Overwrite):
+                    ch = channels[key]
+                    if isinstance(ch, BinaryOperatorAggregate):
+                        ch.update([Overwrite(value=val.value)])
+                    else:
+                        ch.update([val.value])
+                else:
+                    channels[key].update([val])
 
         return all_updates, all_new_next, all_new_sends, all_events, results_by_node
 
@@ -1487,7 +1606,6 @@ class PregelLoop:
         if retry_policy is None:
             return self._execute_func(func, node_input)
 
-        import random
         max_attempts = retry_policy.max_attempts
         for attempt in range(max_attempts):
             try:
@@ -1517,30 +1635,45 @@ class PregelLoop:
                            retry_policy: RetryPolicy | None,
                            timeout_seconds: float) -> Any:
         """Execute a node function with a timeout."""
-        import concurrent.futures
         if retry_policy is None:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
                 future = pool.submit(self._execute_func, func, node_input)
-                try:
-                    return future.result(timeout=timeout_seconds)
-                except concurrent.futures.TimeoutError:
-                    raise TimeoutError(
-                        f"Node timed out after {timeout_seconds}s"
-                    )
+                return future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(
+                    f"Node timed out after {timeout_seconds}s"
+                )
+            finally:
+                pool.shutdown(wait=False)
 
-        import random
         max_attempts = retry_policy.max_attempts
         for attempt in range(max_attempts):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
                 future = pool.submit(self._execute_func, func, node_input)
-                try:
-                    return future.result(timeout=timeout_seconds)
-                except concurrent.futures.TimeoutError:
-                    if attempt >= max_attempts - 1:
-                        raise TimeoutError(
-                            f"Node timed out after {timeout_seconds}s "
-                            f"(attempt {attempt + 1}/{max_attempts})"
-                        )
+                return future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError:
+                if attempt >= max_attempts - 1:
+                    raise TimeoutError(
+                        f"Node timed out after {timeout_seconds}s "
+                        f"(attempt {attempt + 1}/{max_attempts})"
+                    )
+            except Exception as e:
+                retry_on = retry_policy.retry_on
+                should_retry = False
+                if isinstance(retry_on, type):
+                    should_retry = isinstance(e, retry_on)
+                elif isinstance(retry_on, (list, tuple)):
+                    should_retry = isinstance(e, tuple(retry_on))
+                elif callable(retry_on):
+                    should_retry = retry_on(e)
+                else:
+                    should_retry = True
+                if not should_retry or attempt >= max_attempts - 1:
+                    raise
+            finally:
+                pool.shutdown(wait=False)
             interval = retry_policy.initial_interval * (retry_policy.backoff_factor ** attempt)
             interval = min(interval, retry_policy.max_interval)
             if retry_policy.jitter:
@@ -1556,14 +1689,29 @@ class PregelLoop:
             except RuntimeError:
                 loop = None
             if loop and loop.is_running():
-                import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     args = (node_input, config) if needs_config else (node_input,)
-                    future = pool.submit(asyncio.run, func(*args))
+
+                    async def _run_with_context():
+                        token = _current_config.set(config)
+                        try:
+                            return await func(*args)
+                        finally:
+                            _current_config.reset(token)
+
+                    future = pool.submit(lambda: asyncio.run(_run_with_context()))
                     return future.result()
             else:
                 args = (node_input, config) if needs_config else (node_input,)
-                return asyncio.run(func(*args))
+
+                async def _run_with_context():
+                    token = _current_config.set(config)
+                    try:
+                        return await func(*args)
+                    finally:
+                        _current_config.reset(token)
+
+                return asyncio.run(_run_with_context())
         else:
             args = (node_input, config) if needs_config else (node_input,)
             return func(*args)
@@ -1589,7 +1737,6 @@ class PregelLoop:
         if retry_policy is None:
             return await self._aexecute_func(func, node_input)
 
-        import random
         max_attempts = retry_policy.max_attempts
         for attempt in range(max_attempts):
             try:
@@ -1673,17 +1820,20 @@ class PregelLoop:
 
         effective_checkpointer = self.checkpointer or config.get("configurable", {}).get(CONFIG_KEY_CHECKPOINTER)
 
-        saved_cp = subgraph._loop.checkpointer
-        if effective_checkpointer is not None and subgraph._loop.checkpointer is None:
-            subgraph._loop.checkpointer = effective_checkpointer
-
-        try:
+        # Use a shallow copy of the loop to avoid mutating the shared subgraph
+        # object under concurrency. Only override checkpointer on the copy.
+        original_loop = subgraph._loop
+        if effective_checkpointer is not None and original_loop.checkpointer is None:
+            sub_loop = copy.copy(original_loop)
+            sub_loop.checkpointer = effective_checkpointer
+            with self._subgraph_lock:
+                subgraph._loop = sub_loop
+                try:
+                    result = subgraph.invoke(sub_input, config)
+                finally:
+                    subgraph._loop = original_loop
+        else:
             result = subgraph.invoke(sub_input, config)
-        except ParentCommand:
-            subgraph._loop.checkpointer = saved_cp
-            raise
-
-        subgraph._loop.checkpointer = saved_cp
 
         if effective_checkpointer is not None:
             sub_config = {
@@ -1734,17 +1884,21 @@ class PregelLoop:
 
         effective_checkpointer = self.checkpointer or config.get("configurable", {}).get(CONFIG_KEY_CHECKPOINTER)
 
-        saved_cp = subgraph._loop.checkpointer
-        if effective_checkpointer is not None and subgraph._loop.checkpointer is None:
-            subgraph._loop.checkpointer = effective_checkpointer
-
-        try:
+        # Use a shallow copy of the loop to avoid mutating the shared subgraph
+        # object under concurrency. Only override checkpointer on the copy.
+        original_loop = subgraph._loop
+        if effective_checkpointer is not None and original_loop.checkpointer is None:
+            sub_loop = copy.copy(original_loop)
+            sub_loop.checkpointer = effective_checkpointer
+            with self._subgraph_lock:
+                subgraph._loop = sub_loop
+            try:
+                result = await subgraph.ainvoke(sub_input, config)
+            finally:
+                with self._subgraph_lock:
+                    subgraph._loop = original_loop
+        else:
             result = await subgraph.ainvoke(sub_input, config)
-        except ParentCommand:
-            subgraph._loop.checkpointer = saved_cp
-            raise
-
-        subgraph._loop.checkpointer = saved_cp
 
         if effective_checkpointer is not None:
             sub_config = {
@@ -1820,6 +1974,8 @@ class PregelLoop:
         schema_channels = builder.schemas.get(input_schema, builder.channels)
 
         if "__root__" in schema_channels and len(schema_channels) == 1:
+            if "__root__" not in channels or not channels["__root__"].is_available():
+                raise EmptyChannelError()
             return channels["__root__"].get()
 
         result = {}
@@ -1828,17 +1984,16 @@ class PregelLoop:
                 result[key] = channels[key].get()
         return result
 
-    def _process_result(self, result: Any, channels: dict) -> dict | None:
-        """Process node output, apply to channels. Returns the update dict."""
+    def _compute_updates(self, result: Any, channels: dict) -> dict | None:
+        """Compute update dict from result without mutating channels. Returns full dict including Overwrite."""
         updates = {}
 
         if isinstance(result, Send):
             return None
         elif isinstance(result, Command):
-            # Command.PARENT: bubble up to parent graph
             if result.graph == Command.PARENT:
                 raise ParentCommand(result)
-            if result.update:
+            if result.update is not None:
                 tuples = result._update_as_tuples()
                 updates = {k: v for k, v in tuples}
         elif isinstance(result, dict):
@@ -1852,13 +2007,20 @@ class PregelLoop:
                 if not updates:
                     return None
             else:
-                return None
+                for item in result:
+                    if isinstance(item, dict) and not isinstance(item, Command):
+                        updates.update(item)
+                if not updates:
+                    return None
         elif result is not None and "__root__" in channels:
             updates = {"__root__": result}
         else:
             return None
 
-        # Apply updates to channels
+        return updates
+
+    def _apply_updates(self, updates: dict, channels: dict) -> None:
+        """Apply computed updates to channels."""
         for key, val in updates.items():
             if key in channels:
                 if isinstance(val, Overwrite):
@@ -1870,7 +2032,12 @@ class PregelLoop:
                 else:
                     channels[key].update([val])
 
-        return {k: v for k, v in updates.items() if not isinstance(v, Overwrite)}
+    def _process_result(self, result: Any, channels: dict) -> dict | None:
+        """Process node output, apply to channels. Returns the update dict (filtered, no Overwrite)."""
+        updates = self._compute_updates(result, channels)
+        if updates is not None:
+            self._apply_updates(updates, channels)
+        return {k: v for k, v in updates.items() if not isinstance(v, Overwrite)} if updates else None
 
     def _get_start_nodes(self, checkpoint: dict, is_resuming: bool,
                          channels: dict = None) -> tuple[list[str], list[Send]]:
@@ -1956,6 +2123,7 @@ class PregelLoop:
         if node_name in builder.branches:
             for name, branch in builder.branches[node_name].items():
                 try:
+                    full_state = self._read_output(channels)
                     # If result is already a routing decision (list of
                     # Send / str), use it directly instead of re-invoking
                     # the router function, which would produce duplicates.
@@ -1966,15 +2134,9 @@ class PregelLoop:
                         if has_sends_or_strs:
                             path_result = result
                         else:
-                            path_result = branch.path(
-                                result if isinstance(result, dict)
-                                else self._read_output(channels)
-                            )
+                            path_result = branch.path(full_state)
                     else:
-                        path_result = branch.path(
-                            result if isinstance(result, dict)
-                            else self._read_output(channels)
-                        )
+                        path_result = branch.path(full_state)
                 except Exception:
                     continue
 
@@ -2020,10 +2182,10 @@ class PregelLoop:
     def _make_task_config(self, config: dict, node_name: str,
                           channels: dict, scratchpad,
                           custom_writer: Any = None) -> dict:
-        task_config = copy.deepcopy(config)
+        task_config = config.copy()
         writes_list = []
         configurable = {
-            **config.get("configurable", {}),
+            **copy.deepcopy(config.get("configurable", {})),
             CONFIG_KEY_TASK_ID: str(uuid.uuid4()),
             CONFIG_KEY_SEND: lambda w: writes_list.extend(w),
             CONFIG_KEY_READ: lambda select, fresh=False: self._local_read(
@@ -2052,12 +2214,37 @@ class PregelLoop:
         return task_config
 
     def _local_read(self, channels, writes, select, fresh=False):
+        if fresh and writes:
+            updated = {}
+            if isinstance(select, str):
+                for c, v in writes:
+                    if c == select:
+                        updated.setdefault(c, []).append(v)
+            else:
+                select_set = set(select)
+                for c, v in writes:
+                    if c in select_set:
+                        updated.setdefault(c, []).append(v)
+            if updated:
+                local_channels = {}
+                for k, ch in channels.items():
+                    if k in updated:
+                        cp = ch.copy()
+                        cp.update(updated[k])
+                        local_channels[k] = cp
+                    else:
+                        local_channels[k] = ch
+                target = local_channels
+            else:
+                target = channels
+        else:
+            target = channels
         if isinstance(select, str):
-            return channels[select].get() if select in channels and channels[select].is_available() else None
+            return target[select].get() if select in target and target[select].is_available() else None
         result = {}
         for k in select:
-            if k in channels and channels[k].is_available():
-                result[k] = channels[k].get()
+            if k in target and target[k].is_available():
+                result[k] = target[k].get()
         return result
 
     def _apply_context(self, channels: dict) -> None:
@@ -2110,8 +2297,8 @@ class PregelLoop:
             try:
                 val = ch.checkpoint()
                 if val is not MISSING:
-                    cv[name] = val
-            except EmptyChannelError:
+                    cv[name] = copy.deepcopy(val)
+            except (EmptyChannelError, TypeError):
                 pass
         cp = copy.deepcopy(base)
         cp["channel_values"] = cv
@@ -2138,13 +2325,12 @@ class PregelLoop:
     def _save_checkpoint(self, config: dict, checkpoint: dict) -> dict:
         if self.checkpointer is None:
             return config
-        metadata = checkpoint.pop("_metadata", CheckpointMetadata(source="input", step=0))
-        # Generate new id and ts for each save to keep history
-        checkpoint["id"] = str(uuid.uuid4())
-        checkpoint["ts"] = datetime.now(timezone.utc).isoformat()
-        new_config = self.checkpointer.put(config, checkpoint, metadata)
-        # Update config in place so subsequent operations use the correct checkpoint_id
-        config.setdefault("configurable", {})["checkpoint_id"] = new_config.get("configurable", {}).get("checkpoint_id", checkpoint["id"])
+        metadata = checkpoint.get("_metadata", CheckpointMetadata(source="input", step=0))
+        cp_to_save = dict(checkpoint)
+        cp_to_save["id"] = str(uuid.uuid4())
+        cp_to_save["ts"] = datetime.now(timezone.utc).isoformat()
+        new_config = self.checkpointer.put(config, cp_to_save, metadata)
+        config.setdefault("configurable", {})["checkpoint_id"] = new_config.get("configurable", {}).get("checkpoint_id", cp_to_save["id"])
         return new_config
 
     def _get_pending_writes(self, config: dict) -> list:

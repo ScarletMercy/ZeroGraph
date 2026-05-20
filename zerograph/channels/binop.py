@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections.abc
+import copy
 from collections.abc import Callable, Sequence
 from typing import Any, Generic
 
@@ -17,6 +18,18 @@ def _strip_extras(t):
     if hasattr(t, "__origin__"):
         return _strip_extras(t.__origin__)
     return t
+
+
+def _safe_copy(value):
+    if value is MISSING:
+        return value
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        try:
+            return copy.copy(value)
+        except Exception:
+            return value
 
 
 class BinaryOperatorAggregate(Generic[Value], BaseChannel[Value, Value, Value]):
@@ -36,7 +49,7 @@ class BinaryOperatorAggregate(Generic[Value], BaseChannel[Value, Value, Value]):
             typ = dict
         try:
             self.value = typ()
-        except Exception:
+        except TypeError:
             self.value = MISSING
 
     def __eq__(self, other: object) -> bool:
@@ -56,25 +69,26 @@ class BinaryOperatorAggregate(Generic[Value], BaseChannel[Value, Value, Value]):
     def copy(self) -> BinaryOperatorAggregate:
         empty = self.__class__(self.typ, self.operator)
         empty.key = self.key
-        empty.value = self.value
+        empty.value = _safe_copy(self.value)
         return empty
 
     def from_checkpoint(self, checkpoint: Value) -> BinaryOperatorAggregate:
         empty = self.__class__(self.typ, self.operator)
         empty.key = self.key
         if checkpoint is not MISSING:
-            empty.value = checkpoint
+            empty.value = _safe_copy(checkpoint)
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:
         if not values:
             return False
+        seen_overwrite = False
         if self.value is MISSING:
             first = values[0]
             is_ow, ow_val = _get_overwrite(first)
             self.value = ow_val if is_ow else first
+            seen_overwrite = is_ow
             values = values[1:]
-        seen_overwrite = False
         for value in values:
             is_overwrite, overwrite_value = _get_overwrite(value)
             if is_overwrite:
@@ -97,7 +111,7 @@ class BinaryOperatorAggregate(Generic[Value], BaseChannel[Value, Value, Value]):
         return self.value is not MISSING
 
     def checkpoint(self) -> Value:
-        return self.value
+        return _safe_copy(self.value)
 
 
 def _get_overwrite(value: Any) -> tuple[bool, Any]:

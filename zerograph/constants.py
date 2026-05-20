@@ -1,8 +1,9 @@
 """ZeroGraph constants."""
 
+MAX_SEND_DEPTH = 25
 START = "__start__"
 END = "__end__"
-TAG_HIDDEN = "langsmith:hidden"
+TAG_HIDDEN = "zerograph:hidden"
 
 TASKS = "__tasks__"
 INTERRUPT = "__interrupt__"
