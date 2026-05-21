@@ -102,7 +102,7 @@ class Send:
 
     def __hash__(self) -> int:
         try:
-            return hash((self.node, self.arg))
+            return hash((self.node, self.arg, self.timeout))
         except TypeError:
             return hash((self.node,))
 
@@ -114,6 +114,7 @@ class Send:
             isinstance(other, Send)
             and self.node == other.node
             and self.arg == other.arg
+            and self.timeout == other.timeout
         )
 
 

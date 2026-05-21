@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,9 @@ class _CheckpointEncoder(json.JSONEncoder):
         if isinstance(obj, bytes):
             return {_ZG_TYPE: "bytes", "data": obj.hex()}
         if isinstance(obj, datetime):
-            return obj.isoformat()
+            return {_ZG_TYPE: "datetime", "data": obj.isoformat()}
+        if isinstance(obj, timedelta):
+            return {_ZG_TYPE: "timedelta", "data": obj.total_seconds()}
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
@@ -44,13 +46,23 @@ def _decode_obj(obj):
     if isinstance(obj, dict) and _ZG_TYPE in obj:
         t = obj[_ZG_TYPE]
         if t == "set":
-            return set(obj["data"])
+            if "data" in obj:
+                return set(obj["data"])
         if t == "frozenset":
-            return frozenset(obj["data"])
+            if "data" in obj:
+                return frozenset(obj["data"])
         if t == "tuple":
-            return tuple(obj["data"])
+            if "data" in obj:
+                return tuple(obj["data"])
         if t == "bytes":
-            return bytes.fromhex(obj["data"])
+            if "data" in obj:
+                return bytes.fromhex(obj["data"])
+        if t == "datetime":
+            if "data" in obj:
+                return datetime.fromisoformat(obj["data"])
+        if t == "timedelta":
+            if "data" in obj:
+                return timedelta(seconds=obj["data"])
     return obj
 
 

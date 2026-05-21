@@ -55,12 +55,12 @@ def create_supervisor(
         state_schema = AgentState
 
     agent_names: list[str] = []
+    reserved = {"supervisor"}
     for i, agent in enumerate(agents):
         name = _default_agent_name(agent, i)
-        # Ensure uniqueness
         base = name
         counter = 1
-        while name in agent_names:
+        while name in agent_names or name in reserved:
             name = f"{base}_{counter}"
             counter += 1
         agent_names.append(name)

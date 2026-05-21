@@ -50,6 +50,7 @@ def _python_type_to_json(annotation: Any) -> str:
         bool: "boolean",
         list: "array",
         dict: "object",
+        tuple: "array",
     }
     if annotation in type_map:
         return type_map[annotation]
@@ -61,6 +62,12 @@ def _python_type_to_json(annotation: Any) -> str:
             if len(args) == 1:
                 return _python_type_to_json(args[0])
         return type_map.get(origin, "string")
+    import types as _types
+    if isinstance(annotation, _types.UnionType):
+        from typing import get_args
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            return _python_type_to_json(args[0])
     return "string"
 
 

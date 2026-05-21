@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-05-21
+
+### Added
+- 支持 Command.goto 路由（Send/str/list），统一节点结果路由逻辑
+- 支持 waiting_edges（fan-in 边），目标节点仅在前置节点全部完成后触发
+- 支持 resume 时保留 step 计数，不重置为 0
+- 支持 interrupt 保存多个中断值（_save_interrupts）
+- 支持子图自动命名（state_schema 名称 + 去重计数器）
+- 支持 swarm/supervisor 保留名冲突避免
+- 支持 tuple 类型的 conditional_edges 返回值
+- 支持 namedtuple 在 _resolve_futures 中正确还原
+- 支持 frozenset 在 _resolve_futures 中处理
+- 支持 Python 3.10+ UnionType（X | Y）在工具 schema 推断中
+- 支持 timedelta 序列化/反序列化
+- 支持 datetime 使用 _ZG_TYPE 结构化编码（而非裸 isoformat）
+- 支持编译时验证节点目标是已知节点
+- 支持 tool_node tuple 类型映射
+
+### Fixed
+- 修复子图 _loop 交换竞态条件（移除 _subgraph_lock，使用 copy 替代原地修改）
+- 修复 _read_node_input 返回部分状态（现在任一 channel 不可用则抛 EmptyChannelError）
+- 修复 interrupt 时 _current_config 未在 finally 中 reset（使用 finally 确保清理）
+- 修复 interrupt checkpoint 只保存当前节点（现在保留所有待执行节点）
+- 修复 send 节点结果中 Command.goto 未被处理（统一处理 Send/Command.goto）
+- 修复 _compute_updates 不处理 Command.update（现在从 Command 提取 update）
+- 修复 _get_next_nodes 对 list 结果重复路由（shortcut_path 避免重复调用 router）
+- 修复 parallel 路径 new_next 被覆盖而非 update（result_info["new_next"].update）
+- 修复 parallel 路径异常类型只捕获 Exception（改为 BaseException）
+- 修复 send_inputs 未在 send 节点完成后清理（添加 send_inputs.pop）
+- 修复 GraphInterrupt 可变默认参数（() → None + 条件赋值）
+- 修复 Send.__hash__/__eq__ 不包含 timeout 字段
+- 修复 add_messages 中 update 与 remove 冲突（updated_by_new 集合）
+- 修复 NamedBarrierValueAfterFinish.update 不处理空值序列
+- 修复 _decode_obj 缺少 data 键时崩溃（所有类型添加 data 检查）
+- 修复 error_val 缺少 error_type 字段（统一添加）
+- 修复 error_handler 中 input read failed 不包含实际错误信息
+- 修复 tool_node 不支持 tuple 类型映射
+
 ## [0.2.0] - 2026-05-20
 
 ### Fixed (112 bugs)

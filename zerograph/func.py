@@ -78,11 +78,13 @@ def _resolve_futures(obj: Any) -> Any:
         return obj.result()
     elif isinstance(obj, (list, tuple)):
         resolved = [_resolve_futures(item) for item in obj]
+        if hasattr(type(obj), '_make'):
+            return type(obj)._make(resolved)
         return type(obj)(resolved)
     elif isinstance(obj, dict):
         return {k: _resolve_futures(v) for k, v in obj.items()}
-    elif isinstance(obj, set):
-        return {_resolve_futures(item) for item in obj}
+    elif isinstance(obj, (set, frozenset)):
+        return type(obj)(_resolve_futures(item) for item in obj)
     return obj
 
 
@@ -92,11 +94,13 @@ async def _aresolve_futures(obj: Any) -> Any:
         return await obj.aresult()
     elif isinstance(obj, (list, tuple)):
         resolved = [await _aresolve_futures(item) for item in obj]
+        if hasattr(type(obj), '_make'):
+            return type(obj)._make(resolved)
         return type(obj)(resolved)
     elif isinstance(obj, dict):
         return {k: await _aresolve_futures(v) for k, v in obj.items()}
-    elif isinstance(obj, set):
-        return {_aresolve_futures(item) for item in obj}
+    elif isinstance(obj, (set, frozenset)):
+        return type(obj)([await _aresolve_futures(item) for item in obj])
     return obj
 
 

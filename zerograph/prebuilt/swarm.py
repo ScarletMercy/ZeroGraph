@@ -78,14 +78,14 @@ def create_swarm(
 
     # Build agent names — use __name__ with index fallback for uniqueness
     agent_names: list[str] = []
+    reserved = {"tools"} if tools else set()
     for i, agent in enumerate(agents):
         name = getattr(agent, "__name__", None)
-        if not name or name in agent_names:
+        if not name or name in agent_names or name in reserved:
             name = f"agent_{i}"
-        # Ensure uniqueness
         base = name
         counter = 1
-        while name in agent_names:
+        while name in agent_names or name in reserved:
             name = f"{base}_{counter}"
             counter += 1
         agent_names.append(name)

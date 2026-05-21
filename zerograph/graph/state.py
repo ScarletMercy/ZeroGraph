@@ -226,7 +226,12 @@ class StateGraph(Generic[StateT, InputT, OutputT]):
         if not isinstance(node, str) and isinstance(node, CompiledStateGraph):
             subgraph = node
             action = node
-            node = "subgraph"
+            base = getattr(node.builder.state_schema, "__name__", "subgraph")
+            node = base
+            counter = 1
+            while node in self.nodes:
+                node = f"{base}_{counter}"
+                counter += 1
         elif isinstance(action, CompiledStateGraph):
             subgraph = action
         elif not isinstance(node, str):
@@ -254,34 +259,39 @@ class StateGraph(Generic[StateT, InputT, OutputT]):
 
         # Infer input schema and destinations from function annotations
         try:
-            if isfunction(action) or ismethod(action) or callable(action):
-                hints = get_type_hints(getattr(action, "__call__", action))
-                sig = signature(getattr(action, "__call__", action))
-                params = list(sig.parameters.keys())
-                if params and input_schema is None:
-                    first_param = params[0]
-                    if first_param in hints:
-                        hint = hints[first_param]
-                        if isinstance(hint, type) and hasattr(hint, "__annotations__"):
-                            inferred_input = hint
+            if isfunction(action) or ismethod(action):
+                target = action
+            elif callable(action):
+                target = getattr(action, "__call__", action)
+            else:
+                target = action
+            hints = get_type_hints(target)
+            sig = signature(target)
+            params = list(sig.parameters.keys())
+            if params and input_schema is None:
+                first_param = params[0]
+                if first_param in hints:
+                    hint = hints[first_param]
+                    if isinstance(hint, type) and hasattr(hint, "__annotations__"):
+                        inferred_input = hint
 
-                rtn = hints.get("return")
-                if rtn:
-                    rtn_origin = get_origin(rtn)
-                    if rtn_origin is Union:
-                        for arg in get_args(rtn):
-                            arg_origin = get_origin(arg)
-                            if arg_origin is Command:
-                                rtn = arg
-                                rtn_origin = arg_origin
-                                break
-                    if (
-                        rtn_origin is Command
-                        and (rargs := get_args(rtn))
-                        and get_origin(rargs[0]) is Literal
-                        and (vals := get_args(rargs[0]))
-                    ):
-                        ends = vals
+            rtn = hints.get("return")
+            if rtn:
+                rtn_origin = get_origin(rtn)
+                if rtn_origin is Union:
+                    for arg in get_args(rtn):
+                        arg_origin = get_origin(arg)
+                        if arg_origin is Command:
+                            rtn = arg
+                            rtn_origin = arg_origin
+                            break
+                if (
+                    rtn_origin is Command
+                    and (rargs := get_args(rtn))
+                    and get_origin(rargs[0]) is Literal
+                    and (vals := get_args(rargs[0]))
+                ):
+                    ends = vals
         except (NameError, TypeError, StopIteration):
             pass
 
@@ -469,6 +479,12 @@ class StateGraph(Generic[StateT, InputT, OutputT]):
         for name, spec in self.nodes.items():
             if spec.ends:
                 all_sources.add(name)
+                ends = spec.ends.values() if isinstance(spec.ends, dict) else spec.ends
+                for target in ends:
+                    if target not in self.nodes and target != END:
+                        raise ValueError(
+                            f"Node '{name}' destinations contain unknown target '{target}'"
+                        )
 
         for source in all_sources:
             if source not in self.nodes and source != START:

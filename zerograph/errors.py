@@ -34,9 +34,9 @@ class GraphBubbleUp(Exception):
 class GraphInterrupt(GraphBubbleUp):
     """Raised to interrupt graph execution."""
 
-    def __init__(self, interrupts: Sequence = ()) -> None:
-        self.interrupts = interrupts
-        super().__init__(interrupts)
+    def __init__(self, interrupts: Sequence | None = None) -> None:
+        self.interrupts = interrupts if interrupts is not None else ()
+        super().__init__(self.interrupts)
 
 
 class ParentCommand(GraphBubbleUp):

@@ -327,7 +327,7 @@ class PregelLoop:
                             next_nodes.update(branch.ends.values())
                         continue
                     # Resolve the path result to node name(s)
-                    if isinstance(path_result, list):
+                    if isinstance(path_result, (list, tuple)):
                         for item in path_result:
                             if hasattr(item, 'node'):
                                 target = item.node
@@ -342,6 +342,17 @@ class PregelLoop:
             # Remove as_node itself and START
             next_nodes.discard(as_node)
             next_nodes.discard(START)
+
+            # Check waiting_edges: if as_node is part of a fan-in edge,
+            # the target is only reachable if all other sources already completed
+            completed = set(checkpoint.get("_completed_nodes", []))
+            for sources, target in self.builder.waiting_edges:
+                if as_node in sources:
+                    others = set(sources) - {as_node}
+                    if others <= completed:
+                        if target != END:
+                            next_nodes.add(target)
+
             new_cp["_next_nodes"] = list(next_nodes)
 
         return self._save_checkpoint(config, new_cp)
@@ -416,11 +427,13 @@ class PregelLoop:
         # Save initial checkpoint
         checkpoint = self._checkpoint_from_channels(channels, checkpoint)
         checkpoint["_next_nodes"] = next_nodes
-        checkpoint["_step"] = 0
+        if not is_resuming:
+            checkpoint["_step"] = 0
         self._save_checkpoint(config, checkpoint)
 
         last_event = None
         completed_nodes: set[str] = set(checkpoint.get("_completed_nodes", []))
+        base_step = checkpoint.get("_step", 0)
 
         for step in range(recursion_limit + 1):
             if step >= recursion_limit:
@@ -461,7 +474,9 @@ class PregelLoop:
             new_sends: list[Send] = []
             prev_completed = set(completed_nodes)
 
+            remaining = set(next_nodes)
             for node_name in next_nodes:
+                remaining.discard(node_name)
                 if node_name not in builder.nodes:
                     continue
 
@@ -527,6 +542,18 @@ class PregelLoop:
                                     for item in result:
                                         if isinstance(item, Send):
                                             new_sends.append(item)
+                                        elif isinstance(item, Command) and item.goto:
+                                            goto = item.goto
+                                            if isinstance(goto, (list, tuple)):
+                                                for g in goto:
+                                                    if isinstance(g, Send):
+                                                        new_sends.append(g)
+                                                    elif isinstance(g, str) and g != END:
+                                                        new_next.add(g)
+                                            elif isinstance(goto, Send):
+                                                new_sends.append(goto)
+                                            elif isinstance(goto, str) and goto != END:
+                                                new_next.add(goto)
 
                     # Yield custom writer events
                     if "custom" in modes and send_custom_events:
@@ -537,15 +564,17 @@ class PregelLoop:
                         node_next, extra_sends = self._get_next_nodes(builder, node_name, last_result, channels)
                         new_next.update(node_next)
                         new_sends.extend(extra_sends)
+                        send_inputs.pop(node_name, None)
                     elif send_errors:
                         if node_spec.error_handler_node:
-                            error_val = {"node": node_name, "error": str(send_errors[-1])}
+                            error_val = {"node": node_name, "error": str(send_errors[-1]), "error_type": type(send_errors[-1]).__name__}
                             if "__error__" in channels:
                                 channels["__error__"].update([error_val])
                             new_next.add(node_spec.error_handler_node)
                             completed_nodes.add(node_name)
                         else:
                             raise send_errors[-1]
+                        send_inputs.pop(node_name, None)
                     continue
 
                 # Regular node execution
@@ -554,9 +583,9 @@ class PregelLoop:
                 except EmptyChannelError:
                     # Channel not yet populated — skip this node for now
                     continue
-                except Exception:
+                except Exception as e:
                     if node_spec.error_handler_node:
-                        error_val = {"node": node_name, "error": "input read failed"}
+                        error_val = {"node": node_name, "error": str(e), "error_type": type(e).__name__}
                         if "__error__" in channels:
                             channels["__error__"].update([error_val])
                         new_next.add(node_spec.error_handler_node)
@@ -635,21 +664,19 @@ class PregelLoop:
                             timeout=node_spec.timeout.run_timeout if node_spec.timeout else None,
                         )
                 except GraphInterrupt as gi:
-                    _current_config.reset(token)
                     checkpoint = self._checkpoint_from_channels(channels, checkpoint)
-                    checkpoint["_next_nodes"] = (node_name,)
+                    next_for_checkpoint = {node_name} | {n for n in remaining if n in builder.nodes} | new_next
+                    next_for_checkpoint -= completed_nodes
+                    checkpoint["_next_nodes"] = list(next_for_checkpoint)
                     checkpoint["_completed_nodes"] = list(completed_nodes)
-                    for interrupt_val in gi.interrupts:
-                        self._save_interrupt(config, checkpoint, interrupt_val)
+                    self._save_interrupts(config, checkpoint, gi.interrupts)
                     if "values" in modes:
                         val = self._read_output(channels)
                         yield ("values", val) if is_multi else val
                     return
                 except GraphBubbleUp:
-                    _current_config.reset(token)
                     raise
                 except Exception as e:
-                    _current_config.reset(token)
                     if node_spec.error_handler_node:
                         error_val = {"node": node_name, "error": str(e), "error_type": type(e).__name__}
                         if "__error__" in channels:
@@ -660,8 +687,9 @@ class PregelLoop:
                             yield ("tasks", {"type": "task_end", "step": step, "node": node_name}) if is_multi else {"type": "task_end", "step": step, "node": node_name}
                         continue
                     raise
+                finally:
+                    _current_config.reset(token)
 
-                _current_config.reset(token)
                 completed_nodes.add(node_name)
 
                 if "tasks" in modes:
@@ -692,6 +720,18 @@ class PregelLoop:
                             for item in result:
                                 if isinstance(item, Send):
                                     new_sends.append(item)
+                                elif isinstance(item, Command) and item.goto:
+                                    goto = item.goto
+                                    if isinstance(goto, (list, tuple)):
+                                        for g in goto:
+                                            if isinstance(g, Send):
+                                                new_sends.append(g)
+                                            elif isinstance(g, str) and g != END:
+                                                new_next.add(g)
+                                    elif isinstance(goto, Send):
+                                        new_sends.append(goto)
+                                    elif isinstance(goto, str) and goto != END:
+                                        new_next.add(goto)
 
                 if "debug" in modes:
                     dbg_ev = {"type": "task_result", "step": step, "node": node_name, "result": result}
@@ -758,7 +798,7 @@ class PregelLoop:
                             _current_config.reset(send_token)
                             # Propagate Send errors instead of silently swallowing
                             if node_spec.error_handler_node:
-                                error_val = {"node": send.node, "error": str(send_err)}
+                                error_val = {"node": send.node, "error": str(send_err), "error_type": type(send_err).__name__}
                                 if "__error__" in channels:
                                     channels["__error__"].update([error_val])
                                 new_next.add(node_spec.error_handler_node)
@@ -783,6 +823,18 @@ class PregelLoop:
                                     for item in result:
                                         if isinstance(item, Send):
                                             new_sends.append(item)
+                                        elif isinstance(item, Command) and item.goto:
+                                            goto = item.goto
+                                            if isinstance(goto, (list, tuple)):
+                                                for g in goto:
+                                                    if isinstance(g, Send):
+                                                        new_sends.append(g)
+                                                    elif isinstance(g, str) and g != END:
+                                                        new_next.add(g)
+                                            elif isinstance(goto, Send):
+                                                new_sends.append(goto)
+                                            elif isinstance(goto, str) and goto != END:
+                                                new_next.add(goto)
                         completed_nodes.add(send.node)
                         node_next, extra_sends = self._get_next_nodes(builder, send.node, result, channels)
                         new_next.update(node_next)
@@ -822,7 +874,7 @@ class PregelLoop:
             # Save checkpoint
             checkpoint = self._checkpoint_from_channels(channels, checkpoint)
             checkpoint["_next_nodes"] = list(new_next | waiting_next)
-            checkpoint["_step"] = step + 1
+            checkpoint["_step"] = base_step + step + 1
             checkpoint["_completed_nodes"] = list(completed_nodes)
             self._save_checkpoint(config, checkpoint)
 
@@ -905,11 +957,13 @@ class PregelLoop:
         # Save initial checkpoint
         checkpoint = self._checkpoint_from_channels(channels, checkpoint)
         checkpoint["_next_nodes"] = next_nodes
-        checkpoint["_step"] = 0
+        if not is_resuming:
+            checkpoint["_step"] = 0
         self._save_checkpoint(config, checkpoint)
 
         last_event = None
         completed_nodes: set[str] = set(checkpoint.get("_completed_nodes", []))
+        base_step = checkpoint.get("_step", 0)
 
         for step in range(recursion_limit + 1):
             if step >= recursion_limit:
@@ -988,17 +1042,20 @@ class PregelLoop:
                     r = par_results[nn]
                     if r.get("error") == "interrupt":
                         checkpoint = self._checkpoint_from_channels(channels, checkpoint)
-                        checkpoint["_next_nodes"] = (nn,)
+                        next_for_checkpoint = {nn} | new_next
+                        next_for_checkpoint -= completed_nodes
+                        checkpoint["_next_nodes"] = list(next_for_checkpoint)
                         checkpoint["_completed_nodes"] = list(completed_nodes)
-                        for interrupt_val in r.get("interrupts", ()):
-                            self._save_interrupt(config, checkpoint, interrupt_val)
+                        self._save_interrupts(config, checkpoint, r.get("interrupts", ()))
                         if "values" in modes:
                             yield ("values", self._read_output(channels)) if is_multi else self._read_output(channels)
                         return
                     if isinstance(r.get("error"), Exception):
                         raise r["error"]
 
+            async_remaining = set(next_nodes)
             for node_name in next_nodes:
+                async_remaining.discard(node_name)
                 if can_parallel:
                     continue  # Already executed above
                 if node_name not in builder.nodes:
@@ -1063,6 +1120,18 @@ class PregelLoop:
                                     for item in result:
                                         if isinstance(item, Send):
                                             new_sends.append(item)
+                                        elif isinstance(item, Command) and item.goto:
+                                            goto = item.goto
+                                            if isinstance(goto, (list, tuple)):
+                                                for g in goto:
+                                                    if isinstance(g, Send):
+                                                        new_sends.append(g)
+                                                    elif isinstance(g, str) and g != END:
+                                                        new_next.add(g)
+                                            elif isinstance(goto, Send):
+                                                new_sends.append(goto)
+                                            elif isinstance(goto, str) and goto != END:
+                                                new_next.add(goto)
 
                     # Yield custom writer events
                     if "custom" in modes and send_custom_events:
@@ -1073,24 +1142,26 @@ class PregelLoop:
                         node_next, extra_sends = self._get_next_nodes(builder, node_name, last_result, channels)
                         new_next.update(node_next)
                         new_sends.extend(extra_sends)
+                        send_inputs.pop(node_name, None)
                     elif send_errors:
                         if node_spec.error_handler_node:
-                            error_val = {"node": node_name, "error": str(send_errors[-1])}
+                            error_val = {"node": node_name, "error": str(send_errors[-1]), "error_type": type(send_errors[-1]).__name__}
                             if "__error__" in channels:
                                 channels["__error__"].update([error_val])
                             new_next.add(node_spec.error_handler_node)
                             completed_nodes.add(node_name)
                         else:
                             raise send_errors[-1]
+                        send_inputs.pop(node_name, None)
                     continue
 
                 try:
                     node_input = self._read_node_input(channels, node_spec, builder)
                 except EmptyChannelError:
                     continue
-                except Exception:
+                except Exception as e:
                     if node_spec.error_handler_node:
-                        error_val = {"node": node_name, "error": "input read failed"}
+                        error_val = {"node": node_name, "error": str(e), "error_type": type(e).__name__}
                         if "__error__" in channels:
                             channels["__error__"].update([error_val])
                         new_next.add(node_spec.error_handler_node)
@@ -1192,21 +1263,19 @@ class PregelLoop:
                             timeout=node_spec.timeout.run_timeout if node_spec.timeout else None,
                         )
                 except GraphInterrupt as gi:
-                    _current_config.reset(token)
                     checkpoint = self._checkpoint_from_channels(channels, checkpoint)
-                    checkpoint["_next_nodes"] = (node_name,)
+                    next_for_checkpoint = {node_name} | {n for n in async_remaining if n in builder.nodes} | new_next
+                    next_for_checkpoint -= completed_nodes
+                    checkpoint["_next_nodes"] = list(next_for_checkpoint)
                     checkpoint["_completed_nodes"] = list(completed_nodes)
-                    for interrupt_val in gi.interrupts:
-                        self._save_interrupt(config, checkpoint, interrupt_val)
+                    self._save_interrupts(config, checkpoint, gi.interrupts)
                     if "values" in modes:
                         val = self._read_output(channels)
                         yield ("values", val) if is_multi else val
                     return
                 except GraphBubbleUp:
-                    _current_config.reset(token)
                     raise
                 except Exception as e:
-                    _current_config.reset(token)
                     if node_spec.error_handler_node:
                         error_val = {"node": node_name, "error": str(e), "error_type": type(e).__name__}
                         if "__error__" in channels:
@@ -1217,8 +1286,9 @@ class PregelLoop:
                             yield ("tasks", {"type": "task_end", "step": step, "node": node_name}) if is_multi else {"type": "task_end", "step": step, "node": node_name}
                         continue
                     raise
+                finally:
+                    _current_config.reset(token)
 
-                _current_config.reset(token)
                 completed_nodes.add(node_name)
 
                 if "tasks" in modes:
@@ -1245,6 +1315,18 @@ class PregelLoop:
                             for item in result:
                                 if isinstance(item, Send):
                                     new_sends.append(item)
+                                elif isinstance(item, Command) and item.goto:
+                                    goto = item.goto
+                                    if isinstance(goto, (list, tuple)):
+                                        for g in goto:
+                                            if isinstance(g, Send):
+                                                new_sends.append(g)
+                                            elif isinstance(g, str) and g != END:
+                                                new_next.add(g)
+                                    elif isinstance(goto, Send):
+                                        new_sends.append(goto)
+                                    elif isinstance(goto, str) and goto != END:
+                                        new_next.add(goto)
 
                 if "debug" in modes:
                     yield ("debug", {"type": "task_result", "step": step, "node": node_name, "result": result}) if is_multi else {"type": "task_result", "step": step, "node": node_name, "result": result}
@@ -1305,7 +1387,7 @@ class PregelLoop:
                         except Exception as send_err:
                             _current_config.reset(send_token)
                             if node_spec.error_handler_node:
-                                error_val = {"node": send.node, "error": str(send_err)}
+                                error_val = {"node": send.node, "error": str(send_err), "error_type": type(send_err).__name__}
                                 if "__error__" in channels:
                                     channels["__error__"].update([error_val])
                                 new_next.add(node_spec.error_handler_node)
@@ -1329,6 +1411,18 @@ class PregelLoop:
                                     for item in result:
                                         if isinstance(item, Send):
                                             new_sends.append(item)
+                                        elif isinstance(item, Command) and item.goto:
+                                            goto = item.goto
+                                            if isinstance(goto, (list, tuple)):
+                                                for g in goto:
+                                                    if isinstance(g, Send):
+                                                        new_sends.append(g)
+                                                    elif isinstance(g, str) and g != END:
+                                                        new_next.add(g)
+                                            elif isinstance(goto, Send):
+                                                new_sends.append(goto)
+                                            elif isinstance(goto, str) and goto != END:
+                                                new_next.add(goto)
                         completed_nodes.add(send.node)
                         node_next, extra_sends = self._get_next_nodes(builder, send.node, result, channels)
                         new_next.update(node_next)
@@ -1368,7 +1462,7 @@ class PregelLoop:
             # Save checkpoint
             checkpoint = self._checkpoint_from_channels(channels, checkpoint)
             checkpoint["_next_nodes"] = list(new_next | waiting_next)
-            checkpoint["_step"] = step + 1
+            checkpoint["_step"] = base_step + step + 1
             checkpoint["_completed_nodes"] = list(completed_nodes)
             self._save_checkpoint(config, checkpoint)
 
@@ -1438,10 +1532,10 @@ class PregelLoop:
                 except EmptyChannelError:
                     result_info["skipped"] = True
                     return result_info
-                except Exception:
+                except Exception as e:
                     if node_spec.error_handler_node:
                         result_info["error_handler_node"] = node_spec.error_handler_node
-                        result_info["error_val"] = {"node": node_name, "error": "input read failed"}
+                        result_info["error_val"] = {"node": node_name, "error": str(e), "error_type": type(e).__name__}
                         result_info["new_next"] = {node_spec.error_handler_node}
                         return result_info
                     raise
@@ -1517,9 +1611,21 @@ class PregelLoop:
                         for item in result:
                             if isinstance(item, Send):
                                 result_info["new_sends"].append(item)
+                            elif isinstance(item, Command) and item.goto:
+                                goto = item.goto
+                                if isinstance(goto, (list, tuple)):
+                                    for g in goto:
+                                        if isinstance(g, Send):
+                                            result_info["new_sends"].append(g)
+                                        elif isinstance(g, str) and g != END:
+                                            result_info["new_next"].add(g)
+                                elif isinstance(goto, Send):
+                                    result_info["new_sends"].append(goto)
+                                elif isinstance(goto, str) and goto != END:
+                                    result_info["new_next"].add(goto)
 
                 node_next, extra_sends = self._get_next_nodes(builder, node_name, result, channels)
-                result_info["new_next"] = node_next
+                result_info["new_next"].update(node_next)
                 result_info["new_sends"].extend(extra_sends)
                 return result_info
 
@@ -1539,7 +1645,7 @@ class PregelLoop:
         pending_error_writes: list[Any] = []
 
         for r in results:
-            if isinstance(r, Exception):
+            if isinstance(r, BaseException):
                 raise r
 
             node_name = r["node"]
@@ -1820,20 +1926,11 @@ class PregelLoop:
 
         effective_checkpointer = self.checkpointer or config.get("configurable", {}).get(CONFIG_KEY_CHECKPOINTER)
 
-        # Use a shallow copy of the loop to avoid mutating the shared subgraph
-        # object under concurrency. Only override checkpointer on the copy.
-        original_loop = subgraph._loop
-        if effective_checkpointer is not None and original_loop.checkpointer is None:
-            sub_loop = copy.copy(original_loop)
-            sub_loop.checkpointer = effective_checkpointer
-            with self._subgraph_lock:
-                subgraph._loop = sub_loop
-                try:
-                    result = subgraph.invoke(sub_input, config)
-                finally:
-                    subgraph._loop = original_loop
-        else:
-            result = subgraph.invoke(sub_input, config)
+        loop = subgraph._loop
+        if effective_checkpointer is not None and loop.checkpointer is None:
+            loop = copy.copy(loop)
+            loop.checkpointer = effective_checkpointer
+        result = loop.invoke(sub_input, config)
 
         if effective_checkpointer is not None:
             sub_config = {
@@ -1884,21 +1981,11 @@ class PregelLoop:
 
         effective_checkpointer = self.checkpointer or config.get("configurable", {}).get(CONFIG_KEY_CHECKPOINTER)
 
-        # Use a shallow copy of the loop to avoid mutating the shared subgraph
-        # object under concurrency. Only override checkpointer on the copy.
-        original_loop = subgraph._loop
-        if effective_checkpointer is not None and original_loop.checkpointer is None:
-            sub_loop = copy.copy(original_loop)
-            sub_loop.checkpointer = effective_checkpointer
-            with self._subgraph_lock:
-                subgraph._loop = sub_loop
-            try:
-                result = await subgraph.ainvoke(sub_input, config)
-            finally:
-                with self._subgraph_lock:
-                    subgraph._loop = original_loop
-        else:
-            result = await subgraph.ainvoke(sub_input, config)
+        loop = subgraph._loop
+        if effective_checkpointer is not None and loop.checkpointer is None:
+            loop = copy.copy(loop)
+            loop.checkpointer = effective_checkpointer
+        result = await loop.ainvoke(sub_input, config)
 
         if effective_checkpointer is not None:
             sub_config = {
@@ -1980,8 +2067,9 @@ class PregelLoop:
 
         result = {}
         for key in schema_channels:
-            if key in channels and channels[key].is_available():
-                result[key] = channels[key].get()
+            if key not in channels or not channels[key].is_available():
+                raise EmptyChannelError()
+            result[key] = channels[key].get()
         return result
 
     def _compute_updates(self, result: Any, channels: dict) -> dict | None:
@@ -2004,12 +2092,16 @@ class PregelLoop:
                 for item in result:
                     if isinstance(item, dict) and not isinstance(item, (Send, Command)):
                         updates.update(item)
+                    elif isinstance(item, Command) and item.update is not None:
+                        updates.update(dict(item._update_as_tuples()))
                 if not updates:
                     return None
             else:
                 for item in result:
                     if isinstance(item, dict) and not isinstance(item, Command):
                         updates.update(item)
+                    elif isinstance(item, Command) and item.update is not None:
+                        updates.update(dict(item._update_as_tuples()))
                 if not updates:
                     return None
         elif result is not None and "__root__" in channels:
@@ -2121,21 +2213,23 @@ class PregelLoop:
 
         # Check conditional edges
         if node_name in builder.branches:
+            # If result is already a routing decision (list of
+            # Send / str), use it directly instead of re-invoking
+            # the router function, which would produce duplicates.
+            shortcut_path = None
+            if isinstance(result, (list, tuple)):
+                has_sends_or_strs = any(
+                    isinstance(r, (Send, str, Command)) for r in result
+                )
+                if has_sends_or_strs:
+                    shortcut_path = result
+
             for name, branch in builder.branches[node_name].items():
                 try:
-                    full_state = self._read_output(channels)
-                    # If result is already a routing decision (list of
-                    # Send / str), use it directly instead of re-invoking
-                    # the router function, which would produce duplicates.
-                    if isinstance(result, (list, tuple)):
-                        has_sends_or_strs = any(
-                            isinstance(r, (Send, str)) for r in result
-                        )
-                        if has_sends_or_strs:
-                            path_result = result
-                        else:
-                            path_result = branch.path(full_state)
+                    if shortcut_path is not None:
+                        path_result = shortcut_path
                     else:
+                        full_state = self._read_output(channels)
                         path_result = branch.path(full_state)
                 except Exception:
                     continue
@@ -2146,12 +2240,27 @@ class PregelLoop:
                 for dest in path_result:
                     if isinstance(dest, Send):
                         sends.append(dest)
+                    elif isinstance(dest, Command) and dest.goto:
+                        goto = dest.goto
+                        if isinstance(goto, (list, tuple)):
+                            for g in goto:
+                                if isinstance(g, Send):
+                                    sends.append(g)
+                                elif isinstance(g, str) and g != END:
+                                    next_nodes.add(g)
+                        elif isinstance(goto, Send):
+                            sends.append(goto)
+                        elif isinstance(goto, str) and goto != END:
+                            next_nodes.add(goto)
                     elif dest == END:
                         pass
                     elif branch.ends and dest in branch.ends:
                         next_nodes.add(branch.ends[dest])
                     elif dest in builder.nodes:
                         next_nodes.add(dest)
+
+                if shortcut_path is not None:
+                    break
 
         return next_nodes, sends
 
@@ -2341,12 +2450,12 @@ class PregelLoop:
         return []
 
     def _save_interrupt(self, config, checkpoint, interrupt_val):
+        self._save_interrupts(config, checkpoint, [interrupt_val])
+
+    def _save_interrupts(self, config, checkpoint, interrupt_vals):
         if self.checkpointer is not None:
             checkpoint["_metadata"] = CheckpointMetadata(source="interrupt")
             self._save_checkpoint(config, checkpoint)
             if hasattr(self.checkpointer, "put_writes"):
-                self.checkpointer.put_writes(
-                    config,
-                    [(NULL_TASK_ID, INTERRUPT, interrupt_val)],
-                    NULL_TASK_ID,
-                )
+                writes = [(NULL_TASK_ID, INTERRUPT, iv) for iv in interrupt_vals]
+                self.checkpointer.put_writes(config, writes, NULL_TASK_ID)

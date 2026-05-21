@@ -126,6 +126,9 @@ class NamedBarrierValueAfterFinish(Generic[Value], BaseChannel[Value, Value, tup
         return empty
 
     def update(self, values: Sequence) -> bool:
+        if len(values) == 0:
+            return False
+        self.finished = False
         updated = False
         for value in values:
             if value in self.names:
