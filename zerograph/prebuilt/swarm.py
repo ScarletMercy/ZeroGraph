@@ -132,10 +132,13 @@ def create_swarm(
                 if last.get("tool_calls") and tools:
                     return "tools"
 
-                # Check for handoff
-                handoff = last.get("handoff")
-                if handoff and handoff in agent_name_set:
-                    return handoff
+                # Check for handoff — only accept from the current agent's
+                # own assistant message to prevent stale handoffs from
+                # causing infinite loops when an agent returns empty messages.
+                if last.get("role") == "assistant" and last.get("_agent_name") == n:
+                    handoff = last.get("handoff")
+                    if handoff and handoff in agent_name_set:
+                        return handoff
 
                 return END
 

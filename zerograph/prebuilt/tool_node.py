@@ -77,19 +77,24 @@ def _get_callable_name(func: Callable) -> str:
 
 def _extract_schema(func: Callable) -> dict:
     """Extract JSON Schema from a function's signature and docstring."""
+    hints: dict = {}
+    try:
+        from typing import get_type_hints
+        hints = get_type_hints(func)
+    except Exception:
+        pass
     sig = inspect.signature(func)
     properties: dict[str, Any] = {}
     required: list[str] = []
     for name, param in sig.parameters.items():
-        # Skip injected parameters (InjectedState, InjectedStore)
-        hint = param.annotation
+        hint = hints.get(name, param.annotation)
         if isinstance(hint, type) and issubclass(hint, _InjectedMarker):
             continue
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             continue
         if param.default is inspect.Parameter.empty:
             required.append(name)
-        prop: dict[str, Any] = {"type": _python_type_to_json(param.annotation)}
+        prop: dict[str, Any] = {"type": _python_type_to_json(hint)}
         properties[name] = prop
     return {
         "name": _get_callable_name(func),
@@ -177,6 +182,11 @@ class ToolNode:
                 raise
             try:
                 tool_args = self._inject_args(tool_fn, tool_args, state)
+                if asyncio.iscoroutinefunction(tool_fn):
+                    raise TypeError(
+                        f"Tool '{tool_name}' is an async function and cannot "
+                        f"be called synchronously. Use ainvoke() instead."
+                    )
                 output = tool_fn(**tool_args)
             except Exception as e:
                 if self.handle_errors:

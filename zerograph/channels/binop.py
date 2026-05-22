@@ -7,7 +7,7 @@ import copy
 from collections.abc import Callable, Sequence
 from typing import Any, Generic
 
-from zerograph._internal import MISSING
+from zerograph._internal import MISSING, _deepcopy_or_warn
 from zerograph.channels.base import BaseChannel, Value
 from zerograph.errors import EmptyChannelError, InvalidUpdateError
 from zerograph.types import Overwrite
@@ -23,13 +23,13 @@ def _strip_extras(t):
 def _safe_copy(value):
     if value is MISSING:
         return value
-    try:
-        return copy.deepcopy(value)
-    except Exception:
+    result = _deepcopy_or_warn(value)
+    if result is value:
         try:
             return copy.copy(value)
         except Exception:
             return value
+    return result
 
 
 class BinaryOperatorAggregate(Generic[Value], BaseChannel[Value, Value, Value]):
@@ -53,7 +53,11 @@ class BinaryOperatorAggregate(Generic[Value], BaseChannel[Value, Value, Value]):
             self.value = MISSING
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, BinaryOperatorAggregate) and self.operator == other.operator
+        if not isinstance(other, BinaryOperatorAggregate):
+            return False
+        if self.operator is other.operator:
+            return True
+        return self.operator == other.operator
 
     def __hash__(self) -> int:
         return hash(("BinaryOperatorAggregate",))

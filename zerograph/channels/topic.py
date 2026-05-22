@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Sequence
 from typing import Any, Generic
 
-from zerograph._internal import MISSING
+from zerograph._internal import MISSING, _deepcopy_or_warn
 from zerograph.channels.base import BaseChannel, Value
 from zerograph.errors import EmptyChannelError
 
@@ -16,7 +15,7 @@ __all__ = ("Topic",)
 def _flatten(values: Sequence) -> list:
     result = []
     for v in values:
-        if isinstance(v, list):
+        if isinstance(v, (list, tuple)):
             result.extend(v)
         else:
             result.append(v)
@@ -49,19 +48,13 @@ class Topic(Generic[Value], BaseChannel[list[Value], Value, list[Value]]):
 
     def copy(self) -> Topic:
         empty = self.__class__(self.typ, self.accumulate, self.key)
-        try:
-            empty.values = copy.deepcopy(self.values)
-        except Exception:
-            empty.values = self.values.copy()
+        empty.values = _deepcopy_or_warn(self.values) if self.values else []
         return empty
 
     def from_checkpoint(self, checkpoint) -> Topic:
         empty = self.__class__(self.typ, self.accumulate, self.key)
         if checkpoint is not MISSING:
-            try:
-                empty.values = copy.deepcopy(checkpoint)
-            except Exception:
-                empty.values = list(checkpoint)
+            empty.values = _deepcopy_or_warn(checkpoint) if checkpoint else []
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:
@@ -86,7 +79,9 @@ class Topic(Generic[Value], BaseChannel[list[Value], Value, list[Value]]):
         return bool(self.values)
 
     def checkpoint(self):
-        return self.values.copy()
+        if not self.values:
+            return MISSING
+        return _deepcopy_or_warn(self.values) if self.values else MISSING
 
     def consume(self) -> bool:
         if not self.accumulate and self.values:

@@ -42,7 +42,9 @@ class NamedBarrierValue(Generic[Value], BaseChannel[Value, Value, set]):
         empty.seen = self.seen.copy()
         return empty
 
-    def checkpoint(self) -> set:
+    def checkpoint(self):
+        if not self.seen:
+            return MISSING
         return self.seen.copy()
 
     def from_checkpoint(self, checkpoint) -> NamedBarrierValue:

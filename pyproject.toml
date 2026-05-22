@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zerograph"
-version = "0.3.0"
+version = "0.4.0"
 description = "A lightweight graph execution engine with zero external dependencies — state management, checkpointing, streaming, and multi-agent orchestration."
 readme = "README.md"
 license = "MIT"

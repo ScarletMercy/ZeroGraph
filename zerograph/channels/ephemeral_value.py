@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Sequence
 from typing import Any, Generic
 
-from zerograph._internal import MISSING
+from zerograph._internal import MISSING, _deepcopy_or_warn
 from zerograph.channels.base import BaseChannel, Value
 from zerograph.errors import EmptyChannelError, InvalidUpdateError
 
@@ -41,20 +40,14 @@ class EphemeralValue(Generic[Value], BaseChannel[Value, Value, Value]):
         empty = self.__class__(self.typ, self.guard)
         empty.key = self.key
         if self.value is not MISSING:
-            try:
-                empty.value = copy.deepcopy(self.value)
-            except Exception:
-                empty.value = self.value
+            empty.value = _deepcopy_or_warn(self.value)
         return empty
 
     def from_checkpoint(self, checkpoint: Value) -> EphemeralValue:
         empty = self.__class__(self.typ, self.guard)
         empty.key = self.key
         if checkpoint is not MISSING:
-            try:
-                empty.value = copy.deepcopy(checkpoint)
-            except Exception:
-                empty.value = checkpoint
+            empty.value = _deepcopy_or_warn(checkpoint)
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:
@@ -80,4 +73,6 @@ class EphemeralValue(Generic[Value], BaseChannel[Value, Value, Value]):
         return self.value is not MISSING
 
     def checkpoint(self) -> Value:
-        return self.value
+        if self.value is MISSING:
+            return MISSING
+        return _deepcopy_or_warn(self.value)

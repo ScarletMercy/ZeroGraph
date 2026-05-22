@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-05-22
+
+### Added
+- 支持可选依赖导入（sqlite、prebuilt、adapters），缺失时优雅降级
+- 支持统一的 `_deepcopy_or_warn()` 工具函数，失败时回退到原始引用
+- 支持 `InMemoryCache` LRU 淘汰策略（OrderedDict + popitem）
+- 支持线程安全锁（`InMemoryCache`、`InMemoryStore`、`_TaskFuture`）
+- 支持 `_collect_goto` / `_extract_routing` 辅助函数，消除重复路由逻辑
+- 支持 `StateGraph`、`CompiledStateGraph`、`PregelLoop` 的 `__repr__`
+- 支持 `invoke()` / `stream()` 异步函数守卫（异步函数调用时抛出 `TypeError`）
+- 支持 `ToolNode.invoke()` 异步工具守卫
+- 支持生成器/异步生成器异常时正确关闭（`.close()`）
+- 支持 `Send.timeout` 单次发送超时覆盖（优先于节点默认超时）
+- 支持 `_internal`、`func`、`pregel._loop` 日志模块
+- 支持并行中断收集（所有中断统一收集后返回）
+- 支持 `_get_start_nodes` 中 `Command.goto` 路由处理
+- 支持 `Topic._flatten()` 中 tuple 类型
+
+### Fixed
+- 修复 `react_agent` 迭代次数 off-by-one 错误（`>` → `>=`）
+- 修复 swarm handoff 无限循环（仅接受当前 agent 自身消息的 handoff）
+- 修复 `add_messages` 中 `updated_by_new` 未正确跟踪替换/删除
+- 修复 `ContextVar` 重置未在 `finally` 块中执行（并行执行资源泄漏）
+- 修复递归限制检查顺序（先检查 `next_nodes` 为空再抛出 `RecursionError`）
+- 修复并行中断处理（中断存在时抑制非中断错误）
+- 修复 batch/abatch（每个输入获得独立 config 副本，防止交叉污染）
+- 修复 `_read_output` 单通道返回 `{}`（现在返回 `None`）
+- 修复 `_process_result`（仅在字典非空时应用更新）
+- 修复 `Interrupt.__hash__`（移除不可哈希的 `value`）
+- 修复 `NamedBarrierValue.checkpoint()`（空 `seen` 集合返回 `MISSING`）
+- 修复 `channel_values` checkpoint（不再重复深拷贝）
+- 修复 `ThreadPoolExecutor.shutdown`（添加 `cancel_futures=True`）
+- 修复 `_call_node`（处理协程返回值和同步函数中的生成器返回值）
+- 修复 `BinaryOperatorAggregate.__eq__`（添加身份短路优化）
+
+### Changed
+- `InMemoryCache` 改用 `OrderedDict` LRU 淘汰（原为普通 dict FIFO）
+- 提取 `_collect_goto` / `_extract_routing`，减少约 150 行重复代码
+- 改进 `_extract_schema` 类型提示解析（使用 `get_type_hints()`）
+- 改进 `_TaskFuture.aresult()`（基于锁的并发协调）
+- 改进错误聚合（所有错误拼接而非仅保留最后一个）
+
 ## [0.3.0] - 2026-05-21
 
 ### Added

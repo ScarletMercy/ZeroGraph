@@ -69,7 +69,7 @@ def create_react_agent(
             if m.get("role") == "user":
                 break
         agent_turns = sum(1 for m in recent if m.get("role") == "assistant")
-        if agent_turns > max_iterations:
+        if agent_turns >= max_iterations:
             return END
         return "tools"
 

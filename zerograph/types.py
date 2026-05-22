@@ -70,10 +70,7 @@ class Interrupt:
         )
 
     def __hash__(self) -> int:
-        try:
-            return hash((self.value, self.id))
-        except TypeError:
-            return hash((self.id,))
+        return hash((self.id,))
 
     @classmethod
     def from_ns(cls, value: Any, ns: str) -> Interrupt:

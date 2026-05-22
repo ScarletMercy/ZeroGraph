@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import functools
 import inspect
+import threading
 from collections.abc import Callable, Generator, AsyncGenerator
 from typing import Any
 
 from zerograph.checkpoint.base import BaseCheckpointSaver
 from zerograph.constants import PREVIOUS
+
+logger = logging.getLogger(__name__)
 
 __all__ = ("entrypoint", "task")
 
@@ -18,7 +22,7 @@ __all__ = ("entrypoint", "task")
 class _TaskFuture:
     """Future-like object returned by @task decorated functions."""
 
-    __slots__ = ("_func", "_args", "_kwargs", "_result", "_done", "_exception")
+    __slots__ = ("_func", "_args", "_kwargs", "_result", "_done", "_exception", "_lock", "_executing")
 
     def __init__(self, func: Callable, args: tuple, kwargs: dict) -> None:
         self._func = func
@@ -27,35 +31,64 @@ class _TaskFuture:
         self._result = None
         self._done = False
         self._exception = None
+        self._lock = threading.Lock()
+        self._executing = False
 
     def result(self) -> Any:
-        if not self._done:
-            try:
-                self._result = self._func(*self._args, **self._kwargs)
-                self._done = True
-            except Exception as e:
-                self._exception = e
-                self._done = True
-                raise
-        if self._exception is not None:
-            raise self._exception
-        return self._result
+        with self._lock:
+            if not self._done:
+                try:
+                    self._result = self._func(*self._args, **self._kwargs)
+                    self._done = True
+                except Exception as e:
+                    self._exception = e
+                    self._done = True
+                    raise
+            if self._exception is not None:
+                raise self._exception
+            return self._result
 
     async def aresult(self) -> Any:
-        if not self._done:
+        should_execute = False
+        self._lock.acquire()
+        try:
+            if self._done:
+                if self._exception is not None:
+                    raise self._exception
+                return self._result
+            if not self._executing:
+                self._executing = True
+                should_execute = True
+        finally:
+            self._lock.release()
+
+        if should_execute:
+            # We claimed execution rights — run the function.
             try:
                 if asyncio.iscoroutinefunction(self._func):
-                    self._result = await self._func(*self._args, **self._kwargs)
+                    result = await self._func(*self._args, **self._kwargs)
                 else:
-                    self._result = self._func(*self._args, **self._kwargs)
-                self._done = True
+                    result = self._func(*self._args, **self._kwargs)
             except Exception as e:
-                self._exception = e
-                self._done = True
+                with self._lock:
+                    self._exception = e
+                    self._done = True
+                    self._executing = False
                 raise
-        if self._exception is not None:
-            raise self._exception
-        return self._result
+            with self._lock:
+                self._result = result
+                self._done = True
+                self._executing = False
+            return result
+
+        # Another coroutine is executing — spin-wait for it to finish.
+        while True:
+            with self._lock:
+                if self._done:
+                    if self._exception is not None:
+                        raise self._exception
+                    return self._result
+            await asyncio.sleep(0)
 
 
 def task(func: Callable) -> Callable:
@@ -151,6 +184,12 @@ class _EntrypointWrapper:
         try:
             saved = copy.deepcopy(result)
         except Exception:
+            logger.warning(
+                "deepcopy failed for entrypoint result; "
+                "storing original reference. Mutating the return value "
+                "will corrupt the checkpointed previous state.",
+                exc_info=True,
+            )
             saved = result
         from zerograph.checkpoint.base import Checkpoint, CheckpointMetadata
         cp: Checkpoint = {
@@ -183,6 +222,11 @@ class _EntrypointWrapper:
 
     def invoke(self, input: Any, config: dict | None = None) -> Any:
         """Execute the workflow synchronously."""
+        if asyncio.iscoroutinefunction(self._func):
+            raise TypeError(
+                "Cannot invoke() an async function synchronously. "
+                "Use ainvoke() instead."
+            )
         kwargs = self._build_kwargs(input, config)
         result = self._func(input, **kwargs)
         result = _resolve_futures(result)
@@ -208,6 +252,11 @@ class _EntrypointWrapper:
         all events are collected during execution and yielded after
         completion. For true streaming, use StateGraph with generator nodes.
         """
+        if asyncio.iscoroutinefunction(self._func):
+            raise TypeError(
+                "Cannot stream() an async function synchronously. "
+                "Use astream() instead."
+            )
         kwargs = self._build_kwargs(input, config)
         events: list = []
 

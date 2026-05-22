@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Sequence
 from typing import Any, Generic
 
-from zerograph._internal import MISSING
+from zerograph._internal import MISSING, _deepcopy_or_warn
 from zerograph.channels.base import BaseChannel, Value
 from zerograph.errors import EmptyChannelError, InvalidUpdateError
 
@@ -39,19 +38,13 @@ class LastValue(Generic[Value], BaseChannel[Value, Value, Value]):
     def copy(self) -> LastValue:
         empty = self.__class__(self.typ, self.key)
         if self.value is not MISSING:
-            try:
-                empty.value = copy.deepcopy(self.value)
-            except Exception:
-                empty.value = self.value
+            empty.value = _deepcopy_or_warn(self.value)
         return empty
 
     def from_checkpoint(self, checkpoint: Value) -> LastValue:
         empty = self.__class__(self.typ, self.key)
         if checkpoint is not MISSING:
-            try:
-                empty.value = copy.deepcopy(checkpoint)
-            except Exception:
-                empty.value = checkpoint
+            empty.value = _deepcopy_or_warn(checkpoint)
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:
@@ -74,7 +67,9 @@ class LastValue(Generic[Value], BaseChannel[Value, Value, Value]):
         return self.value is not MISSING
 
     def checkpoint(self) -> Value:
-        return self.value
+        if self.value is MISSING:
+            return MISSING
+        return _deepcopy_or_warn(self.value)
 
 
 class LastValueAfterFinish(Generic[Value], BaseChannel[Value, Value, tuple]):
@@ -104,25 +99,20 @@ class LastValueAfterFinish(Generic[Value], BaseChannel[Value, Value, tuple]):
     def checkpoint(self):
         if self.value is MISSING:
             return MISSING
-        return (self.value, self.finished)
+        val = _deepcopy_or_warn(self.value)
+        return (val, self.finished)
 
     def copy(self) -> LastValueAfterFinish:
         empty = self.__class__(self.typ, self.key)
         if self.value is not MISSING:
-            try:
-                empty.value = copy.deepcopy(self.value)
-            except Exception:
-                empty.value = self.value
+            empty.value = _deepcopy_or_warn(self.value)
         empty.finished = self.finished
         return empty
 
     def from_checkpoint(self, checkpoint) -> LastValueAfterFinish:
         empty = self.__class__(self.typ, self.key)
         if checkpoint is not MISSING:
-            try:
-                empty.value = copy.deepcopy(checkpoint[0])
-            except Exception:
-                empty.value = checkpoint[0]
+            empty.value = _deepcopy_or_warn(checkpoint[0])
             empty.finished = checkpoint[1]
         return empty
 

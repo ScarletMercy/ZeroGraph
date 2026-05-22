@@ -63,11 +63,14 @@ def add_messages(existing: Sequence, new_messages: Sequence) -> list:
                 for i in range(len(to_append) - 1, -1, -1):
                     if _get_message_id(to_append[i]) == mid:
                         to_append[i] = msg
+                        updated_by_new.add(mid)
                         break
             else:
                 to_append.append(msg)
                 if mid is not None:
                     new_ids.add(mid)
+                    if mid in to_remove:
+                        updated_by_new.add(mid)
 
     to_remove -= updated_by_new
 

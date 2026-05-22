@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import threading
+from zerograph._internal import _deepcopy_or_warn
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -54,41 +56,57 @@ class InMemoryStore(BaseStore):
 
     def __init__(self) -> None:
         self._data: dict[str, dict[str, StoreItem]] = {}
+        self._lock = threading.Lock()
+
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        result._data = copy.deepcopy(self._data, memo)
+        result._lock = threading.Lock()
+        return result
 
     def get(self, namespace: str, key: str) -> StoreItem | None:
-        ns = self._data.get(namespace)
-        if ns is None:
+        with self._lock:
+            ns = self._data.get(namespace)
+            if ns is None:
+                return None
+            item = ns.get(key)
+            if item is not None:
+                return _deepcopy_or_warn(item)
             return None
-        item = ns.get(key)
-        return copy.deepcopy(item) if item is not None else None
 
     def search(self, namespace: str, *, prefix: str = "",
                limit: int = 10) -> list[StoreItem]:
-        ns = self._data.get(namespace, {})
-        items = [
-            copy.deepcopy(item) for key, item in ns.items()
-            if key.startswith(prefix)
-        ]
+        with self._lock:
+            ns = self._data.get(namespace, {})
+            items: list[StoreItem] = []
+            for key, item in ns.items():
+                if key.startswith(prefix):
+                    items.append(_deepcopy_or_warn(item))
         items.sort(key=lambda x: x.updated_at, reverse=True)
         return items[:limit]
 
     def put(self, namespace: str, key: str, value: Any) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        if namespace not in self._data:
-            self._data[namespace] = {}
-        existing = self._data[namespace].get(key)
-        if existing is not None:
-            self._data[namespace][key] = StoreItem(
-                key=key, value=value, namespace=namespace,
-                created_at=existing.created_at, updated_at=now,
-            )
-        else:
-            self._data[namespace][key] = StoreItem(
-                key=key, value=value, namespace=namespace,
-                created_at=now, updated_at=now,
-            )
+        stored_value = _deepcopy_or_warn(value)
+        with self._lock:
+            if namespace not in self._data:
+                self._data[namespace] = {}
+            existing = self._data[namespace].get(key)
+            if existing is not None:
+                self._data[namespace][key] = StoreItem(
+                    key=key, value=stored_value, namespace=namespace,
+                    created_at=existing.created_at, updated_at=now,
+                )
+            else:
+                self._data[namespace][key] = StoreItem(
+                    key=key, value=stored_value, namespace=namespace,
+                    created_at=now, updated_at=now,
+                )
 
     def delete(self, namespace: str, key: str) -> None:
-        ns = self._data.get(namespace)
-        if ns is not None:
-            ns.pop(key, None)
+        with self._lock:
+            ns = self._data.get(namespace)
+            if ns is not None:
+                ns.pop(key, None)

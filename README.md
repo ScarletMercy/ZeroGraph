@@ -1,32 +1,32 @@
 # ZeroGraph
 
-A lightweight graph execution engine for building stateful, multi-step workflows — with **zero external dependencies**.
+一个轻量级图执行引擎，用于构建有状态的多步骤工作流 —— **零外部依赖**。
 
-Inspired by [LangGraph](https://github.com/langchain-ai/langgraph), ZeroGraph implements a Pregel-like superstep execution model with checkpointing, streaming, subgraph support, and prebuilt LLM agent patterns, all in pure Python.
+受 [LangGraph](https://github.com/langchain-ai/langgraph) 启发，ZeroGraph 实现了类似 Pregel 的超步执行模型，支持检查点、流式输出、子图支持和预构建 LLM 智能体模式，全部纯 Python 实现。
 
-## Features
+## 特性
 
-- **StateGraph** — Define workflows as typed state machines with nodes, edges, and conditional routing
-- **Channel System** — Flexible state management via reducers (`LastValue`, `BinaryOperatorAggregate`, `AnyValue`, `Topic`, etc.)
-- **Checkpointing** — Persist and resume execution with `InMemorySaver` and `SqliteSaver` (sync + async)
-- **Streaming** — Multiple stream modes: `values`, `updates`, `custom`, `messages`, `checkpoints`, `tasks`
-- **Subgraphs** — Nest graphs within graphs with namespace-isolated state
-- **Interrupt & Resume** — Pause execution at any node and resume later with user input
-- **Functional API** — `@entrypoint` and `@task` decorators for workflow-style definitions
-- **Cache & Store** — Node-level result caching (with TTL) and long-term key-value memory
-- **Prebuilt Agents** — `ToolNode`, `create_react_agent`, `create_supervisor`, `create_swarm`
-- **LLM Streaming** — `LLMStreamAdapter` for OpenAI/Anthropic-style chunk streaming
-- **Visualization** — Generate Mermaid diagrams from any `StateGraph`
+- **StateGraph** —— 将工作流定义为带类型的状态机，支持节点、边和条件路由
+- **通道系统** —— 通过归约器灵活管理状态（`LastValue`、`BinaryOperatorAggregate`、`AnyValue`、`Topic` 等）
+- **检查点** —— 使用 `InMemorySaver` 和 `SqliteSaver`（同步 + 异步）持久化和恢复执行
+- **流式输出** —— 多种流模式：`values`、`updates`、`custom`、`messages`、`checkpoints`、`tasks`
+- **子图** —— 在图中嵌套图，状态按命名空间隔离
+- **中断与恢复** —— 在任意节点暂停执行，稍后使用用户输入恢复
+- **函数式 API** —— `@entrypoint` 和 `@task` 装饰器，工作流风格定义
+- **缓存与存储** —— 节点级结果缓存（支持 TTL）和长期键值记忆
+- **预构建智能体** —— `ToolNode`、`create_react_agent`、`create_supervisor`、`create_swarm`
+- **LLM 流式** —— `LLMStreamAdapter` 适配 OpenAI/Anthropic 风格的分块流式
+- **可视化** —— 从任意 `StateGraph` 生成 Mermaid 图
 
-## Installation
+## 安装
 
 ```bash
 pip install zerograph
 ```
 
-## Quick Start
+## 快速开始
 
-### A Simple Linear Graph
+### 简单线性图
 
 ```python
 from typing import Annotated, TypedDict
@@ -37,10 +37,10 @@ class State(TypedDict):
     messages: Annotated[list, operator.add]
 
 def greet(state: State) -> dict:
-    return {"messages": ["Hello!"]}
+    return {"messages": ["你好！"]}
 
 def bye(state: State) -> dict:
-    return {"messages": ["Goodbye!"]}
+    return {"messages": ["再见！"]}
 
 graph = StateGraph(State)
 graph.add_node("greet", greet)
@@ -51,10 +51,10 @@ graph.add_edge("bye", END)
 
 app = graph.compile()
 result = app.invoke({"messages": []})
-print(result["messages"])  # ['Hello!', 'Goodbye!']
+print(result["messages"])  # ['你好！', '再见！']
 ```
 
-### Conditional Routing
+### 条件路由
 
 ```python
 from zerograph import StateGraph, START, END
@@ -65,34 +65,35 @@ def router(state: dict) -> str:
     return "negative"
 
 graph = StateGraph(dict)
-graph.add_node("positive", lambda s: {"label": "pos"})
-graph.add_node("negative", lambda s: {"label": "neg"})
+graph.add_node("positive", lambda s: {"label": "正"})
+graph.add_node("negative", lambda s: {"label": "负"})
 graph.add_conditional_edges(START, router, {"positive": "positive", "negative": "negative"})
 graph.add_edge("positive", END)
 graph.add_edge("negative", END)
 
 app = graph.compile()
-print(app.invoke({"x": 5}))   # {'x': 5, 'label': 'pos'}
-print(app.invoke({"x": -3}))  # {'x': -3, 'label': 'neg'}
+print(app.invoke({"x": 5}))   # {'x': 5, 'label': '正'}
+print(app.invoke({"x": -3}))  # {'x': -3, 'label': '负'}
 ```
 
-### Streaming
+### 流式输出
 
 ```python
 app = graph.compile()
 for event in app.stream({"messages": []}, stream_mode="updates"):
     print(event)
-# {'greet': {'messages': ['Hello!']}}
-# {'bye': {'messages': ['Goodbye!']}}
+# {'greet': {'messages': ['你好！']}}
+# {'bye': {'messages': ['再见！']}}
 ```
 
-### Checkpointing & Interrupt
+### 检查点与中断
 
 ```python
 from zerograph import StateGraph, START, END, InMemorySaver, interrupt
+from zerograph.types import Command
 
 def human_review(state: dict) -> dict:
-    answer = interrupt("Please review and confirm:")
+    answer = interrupt("请审核并确认：")
     return {"approved": answer}
 
 graph = StateGraph(dict)
@@ -103,96 +104,96 @@ graph.add_edge("review", END)
 checkpointer = InMemorySaver()
 app = graph.compile(checkpointer=checkpointer, interrupt_after=["review"])
 
-# First call — pauses at "review"
+# 第一次调用 —— 在 "review" 处暂停
 config = {"configurable": {"thread_id": "1"}}
 result = app.invoke({"approved": False}, config)
 
-# Resume with user input
+# 使用用户输入恢复
 result = app.invoke(Command(resume=True), config)
 print(result["approved"])  # True
 ```
 
-### ReAct Agent
+### ReAct 智能体
 
 ```python
 from zerograph import create_react_agent
 
 def search(query: str) -> str:
-    """Search the web."""
-    return f"Result for {query}"
+    """搜索网页。"""
+    return f"{query} 的结果"
 
 def calculator(expr: str) -> float:
-    """Evaluate a math expression."""
+    """计算数学表达式。"""
     return eval(expr)
 
 def llm_call(messages, tools=None):
-    # Your LLM integration here
+    # 你的 LLM 集成代码
     ...
 
 agent = create_react_agent(llm_call, [search, calculator])
-result = agent.invoke({"messages": [{"role": "user", "content": "What is 2+2?"}]})
+result = agent.invoke({"messages": [{"role": "user", "content": "2+2 等于多少？"}]})
 ```
 
-## API Overview
+## API 概览
 
-### Core
+### 核心
 
-| Symbol | Description |
-|--------|-------------|
-| `StateGraph` | Graph builder with typed state |
-| `CompiledStateGraph` | Compiled, executable graph |
-| `START`, `END` | Special node constants |
-| `Send` | Dynamic fan-out to specific nodes |
-| `Command` | Update state and control flow |
+| 符号 | 说明 |
+|------|------|
+| `StateGraph` | 带类型状态的图构建器 |
+| `CompiledStateGraph` | 编译后的可执行图 |
+| `START`, `END` | 特殊节点常量 |
+| `Send` | 动态扇出到指定节点 |
+| `Command` | 更新状态并控制流程 |
 
-### Execution
+### 执行
 
-| Symbol | Description |
-|--------|-------------|
-| `interrupt()` | Pause execution from within a node |
-| `entrypoint()` | Decorator for functional API entry points |
-| `task()` | Decorator for discrete work units |
+| 符号 | 说明 |
+|------|------|
+| `interrupt()` | 从节点内部暂停执行 |
+| `entrypoint()` | 函数式 API 入口点装饰器 |
+| `task()` | 离散工作单元装饰器 |
 
-### Checkpointing
+### 检查点
 
-| Symbol | Description |
-|--------|-------------|
-| `BaseCheckpointSaver` | Abstract checkpoint backend |
-| `InMemorySaver` | In-memory checkpoint storage |
-| `SqliteSaver` | SQLite-backed checkpoint storage |
-| `AsyncSqliteSaver` | Async SQLite checkpoint storage |
+| 符号 | 说明 |
+|------|------|
+| `BaseCheckpointSaver` | 抽象检查点后端 |
+| `InMemorySaver` | 内存检查点存储 |
+| `SqliteSaver` | SQLite 检查点存储 |
+| `AsyncSqliteSaver` | 异步 SQLite 检查点存储 |
 
-### State & Types
+### 状态与类型
 
-| Symbol | Description |
-|--------|-------------|
-| `add_messages` | Reducer for message lists (upsert by ID) |
-| `RemoveMessage` | Marker to remove a message by ID |
-| `RetryPolicy` | Configurable retry with exponential backoff |
-| `TimeoutPolicy` | Per-node timeout configuration |
+| 符号 | 说明 |
+|------|------|
+| `add_messages` | 消息列表归约器（按 ID 进行 upsert） |
+| `RemoveMessage` | 按 ID 删除消息的标记 |
+| `RetryPolicy` | 可配置的指数退避重试策略 |
+| `TimeoutPolicy` | 每节点超时配置 |
 
-### Prebuilt Agents
+### 预构建智能体
 
-| Symbol | Description |
-|--------|-------------|
-| `ToolNode` | Node that executes tool calls |
-| `create_react_agent` | Build a ReAct loop in one call |
-| `create_supervisor` | Build a supervisor multi-agent graph |
-| `create_swarm` | Build a swarm with handoff-based routing |
-| `LLMStreamAdapter` | Stream adapter for OpenAI/Anthropic chunks |
+| 符号 | 说明 |
+|------|------|
+| `ToolNode` | 执行工具调用的节点 |
+| `create_react_agent` | 一行构建 ReAct 循环 |
+| `create_supervisor` | 构建主管多智能体图 |
+| `create_swarm` | 构建基于 handoff 路由的群组 |
+| `LLMStreamAdapter` | OpenAI/Anthropic 分块流适配器 |
 
-### Infrastructure
+### 基础设施
 
-| Symbol | Description |
-|--------|-------------|
-| `BaseCache` / `InMemoryCache` | Node-level result caching with TTL |
-| `BaseStore` / `InMemoryStore` | Long-term key-value memory |
+| 符号 | 说明 |
+|------|------|
+| `BaseCache` / `InMemoryCache` | 节点级结果缓存，支持 TTL |
+| `BaseStore` / `InMemoryStore` | 长期键值记忆 |
 
-## Requirements
+## 要求
 
 - Python >= 3.11
-- No external dependencies
+- 零外部依赖
 
-## License
+## 许可证
 
 [MIT](LICENSE)

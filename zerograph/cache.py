@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -35,11 +38,21 @@ class BaseCache(ABC):
 
 
 class InMemoryCache(BaseCache):
-    """In-memory cache with TTL support and size limit."""
+    """In-memory cache with TTL support and LRU eviction."""
 
     def __init__(self, maxsize: int = 256) -> None:
-        self._store: dict[str, tuple[Any, float | None]] = {}
+        self._store: OrderedDict[str, tuple[Any, float | None]] = OrderedDict()
         self._maxsize = maxsize
+        self._lock = threading.Lock()
+
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        result._store = copy.deepcopy(self._store, memo)
+        result._maxsize = self._maxsize
+        result._lock = threading.Lock()
+        return result
 
     def _evict(self) -> None:
         if not self._store:
@@ -50,28 +63,32 @@ class InMemoryCache(BaseCache):
             for k in expired:
                 del self._store[k]
             return
-        oldest = next(iter(self._store))
-        del self._store[oldest]
+        self._store.popitem(last=False)
 
     def get(self, key: str) -> Any | None:
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        value, expires_at = entry
-        if expires_at is not None and time.monotonic() > expires_at:
-            self._store.pop(key, None)
-            return None
-        return value
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            value, expires_at = entry
+            if expires_at is not None and time.monotonic() > expires_at:
+                del self._store[key]
+                return None
+            self._store.move_to_end(key)
+            return value
 
     def set(self, key: str, value: Any, ttl: float | None = None) -> None:
-        if self._maxsize <= 0:
-            return
-        if key not in self._store and len(self._store) >= self._maxsize:
-            self._evict()
-        expires_at = None
-        if ttl is not None:
-            expires_at = time.monotonic() + ttl
-        self._store[key] = (value, expires_at)
+        with self._lock:
+            if self._maxsize <= 0:
+                return
+            if key not in self._store and len(self._store) >= self._maxsize:
+                self._evict()
+            expires_at = None
+            if ttl is not None:
+                expires_at = time.monotonic() + ttl
+            self._store[key] = (value, expires_at)
+            self._store.move_to_end(key)
 
     def clear(self) -> None:
-        self._store.clear()
+        with self._lock:
+            self._store.clear()

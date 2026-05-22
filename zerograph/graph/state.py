@@ -36,6 +36,7 @@ from zerograph.types import (
     Interrupt,
     RetryPolicy,
     Send,
+    StateSnapshot,
     TimeoutPolicy,
 )
 
@@ -99,7 +100,7 @@ class StateGraph(Generic[StateT, InputT, OutputT]):
 
         from typing import Annotated
         import operator
-        from ZeroGraph import StateGraph, START, END
+        from zerograph import StateGraph, START, END
 
         class MyState(TypedDict):
             messages: Annotated[list, operator.add]
@@ -147,6 +148,9 @@ class StateGraph(Generic[StateT, InputT, OutputT]):
         if context_schema is not None:
             self._add_context_schema(context_schema)
 
+    def __repr__(self) -> str:
+        return f"StateGraph(nodes={list(self.nodes.keys())})"
+
     @property
     def _all_edges(self) -> set[tuple[str, str]]:
         return self.edges | {
@@ -159,9 +163,15 @@ class StateGraph(Generic[StateT, InputT, OutputT]):
             self.schemas[schema] = channels
             for key, channel in channels.items():
                 if key in self.channels:
+                    existing = self.channels[key]
                     if isinstance(channel, LastValue):
+                        if isinstance(existing, LastValue) and existing.typ != channel.typ:
+                            raise ValueError(
+                                f"Channel '{key}' already exists with type "
+                                f"{existing.typ}, cannot redeclare as {channel.typ}"
+                            )
                         continue
-                    if self.channels[key] != channel:
+                    if existing != channel:
                         raise ValueError(
                             f"Channel '{key}' already exists with a different type"
                         )
@@ -599,6 +609,9 @@ class CompiledStateGraph:
     Created by calling ``StateGraph.compile()``.  Do not instantiate directly.
     """
 
+    def __repr__(self) -> str:
+        return f"CompiledStateGraph(nodes={list(self.builder.nodes.keys())})"
+
     def __init__(
         self,
         *,
@@ -726,13 +739,33 @@ class CompiledStateGraph:
 
     def batch(self, inputs: list[Any], config: dict | None = None) -> list[Any]:
         """Execute the graph for multiple inputs sequentially."""
-        return [self.invoke(inp, config) for inp in inputs]
+        configs = [
+            {**config, "configurable": {**config.get("configurable", {})}}
+            if config else None
+            for _ in inputs
+        ]
+        return [self.invoke(inp, c) for inp, c in zip(inputs, configs)]
 
     async def abatch(self, inputs: list[Any], config: dict | None = None) -> list[Any]:
         """Execute the graph for multiple inputs concurrently."""
-        return await asyncio.gather(
-            *[self.ainvoke(inp, config) for inp in inputs]
+        configs = [
+            {**config, "configurable": {**config.get("configurable", {})}}
+            if config else None
+            for _ in inputs
+        ]
+        results = await asyncio.gather(
+            *[self.ainvoke(inp, c) for inp, c in zip(inputs, configs)],
+            return_exceptions=True,
         )
+        # Propagate the first exception (if any) while preserving completed results
+        first_exc = None
+        for r in results:
+            if isinstance(r, BaseException):
+                if first_exc is None:
+                    first_exc = r
+        if first_exc is not None:
+            raise first_exc
+        return results
 
 
 
