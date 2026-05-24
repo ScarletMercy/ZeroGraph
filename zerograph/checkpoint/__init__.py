@@ -9,7 +9,12 @@ from zerograph.checkpoint.base import (
     PendingWrite,
 )
 from zerograph.checkpoint.memory import InMemorySaver
-from zerograph.checkpoint.sqlite import SqliteSaver, AsyncSqliteSaver
+
+try:
+    from zerograph.checkpoint.sqlite import SqliteSaver, AsyncSqliteSaver
+except ImportError:
+    SqliteSaver = None  # type: ignore[assignment,misc]
+    AsyncSqliteSaver = None  # type: ignore[assignment,misc]
 
 __all__ = (
     "BaseCheckpointSaver",

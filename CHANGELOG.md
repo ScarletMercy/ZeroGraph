@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-05-23
+
+### Added
+- 支持 `InMemorySaver` 全方法线程安全锁和 `__deepcopy__`
+- 支持 SQLite JSON 编码格式版本化（`__zg_v1_type__` + `__zg_v1_v__`），兼容旧格式
+- 支持 `SqliteSaver` 关闭后防重复使用（`_closed` 标记）
+- 支持 send 节点中 `GraphInterrupt` 正确保存中断并返回
+- 支持异步 generator 检测（返回时抛出 `TypeError`）
+- 支持 `_apply_input` 处理 `Overwrite` 值
+- 支持超时执行继承上下文变量（`contextvars.copy_context()`）
+- 支持异步重试带超时（`asyncio.wait_for` + 重试循环）
+- 支持工具参数为 dict 时跳过 JSON 解析
+- 支持 `_inject_args` 复制参数字典防突变
+- 新增 `tests/test_channels.py` 通道测试
+- 新增 `tests/test_interrupt.py` 中断测试
+
+### Fixed
+- 修复 `_TaskFuture` 自旋等待改为 `asyncio.Event` 通知
+- 修复 `_TaskFuture.result()` 未检测异步函数（协程泄漏）
+- 修复任务执行后未释放参数内存（`_func`/`_args`/`_kwargs` 置 `None`）
+- 修复入口点 `_build_kwargs` 未跳过首参注入
+- 修复 pending writes 在用户输入之后应用（应为之前，用户输入优先）
+- 修复 `GraphBubbleUp` 被重试策略吞掉（现在直接重新抛出）
+- 修复 SQLite `Interrupt` 序列化仅在 `INTERRUPT` 通道触发
+- 修复 `AsyncSqliteSaver.close()` 使用 `wait=False` 导致资源泄漏
+- 修复 `Topic.checkpoint()` 冗余 `if self.values` 检查
+- 修复缓存键使用 `hash(repr())`（改为 SHA256 避免碰撞）
+- 修复可视化标签未转义换行/花括号/尖括号
+- 修复可视化 `md5` 改为 `sha256`
+- 修复可视化数字开头 ID 缺少前缀
+
+### Removed
+- 删除 `pregel/_algo.py` 390 行死代码
+- 移除 `pregel/__init__.py` 中已删除模块的导出
+
+### Changed
+- `_deepcopy_or_warn` 日志级别从 debug 提升为 warning
+- SQLite 导入改为可选（`checkpoint/__init__.py`）
+
 ## [0.4.0] - 2026-05-22
 
 ### Added

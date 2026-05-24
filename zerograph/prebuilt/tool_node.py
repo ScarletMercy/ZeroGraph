@@ -134,6 +134,7 @@ class ToolNode:
         self, tool_fn: Callable, tool_args: dict, state: dict
     ) -> dict:
         """Detect InjectedState / InjectedStore annotations and add them."""
+        tool_args = dict(tool_args)
         hints = {}
         try:
             from typing import get_type_hints
@@ -163,7 +164,8 @@ class ToolNode:
             tc_id = tc.get("id", "")
             try:
                 tool_name = tc["function"]["name"]
-                tool_args = json.loads(tc["function"]["arguments"])
+                raw_args = tc["function"]["arguments"]
+                tool_args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
             except (KeyError, TypeError, json.JSONDecodeError) as e:
                 if self.handle_errors:
                     results.append(
@@ -210,7 +212,8 @@ class ToolNode:
             tc_id = tc.get("id", "")
             try:
                 tool_name = tc["function"]["name"]
-                tool_args = json.loads(tc["function"]["arguments"])
+                raw_args = tc["function"]["arguments"]
+                tool_args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
             except (KeyError, TypeError, json.JSONDecodeError) as e:
                 if self.handle_errors:
                     results.append(

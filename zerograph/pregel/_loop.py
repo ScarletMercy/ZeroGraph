@@ -8,12 +8,14 @@ import copy
 import inspect
 import logging
 import itertools
+import hashlib
 import random
 import threading
 import time
 import uuid
 from collections import defaultdict
 from collections.abc import Generator, AsyncGenerator, Callable
+import contextvars
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
@@ -425,7 +427,14 @@ class PregelLoop:
             if ch == RESUME:
                 resume_value = val
 
-        # Apply input
+        # Apply pending writes from checkpoint (non-RESUME channel writes)
+        for tid, ch, val in pending_writes:
+            if ch == RESUME:
+                continue
+            if ch in channels and val is not None:
+                channels[ch].update([val])
+
+        # Apply input (user input takes priority over pending writes)
         if isinstance(input, Command):
             if input.update:
                 self._apply_input(input.update, channels)
@@ -435,13 +444,6 @@ class PregelLoop:
             self._apply_input(input, channels)
         else:
             self._apply_input({"__root__": input}, channels)
-
-        # Apply pending writes from checkpoint (non-RESUME channel writes)
-        for tid, ch, val in pending_writes:
-            if ch == RESUME:
-                continue
-            if ch in channels and val is not None:
-                channels[ch].update([val])
 
         # Apply context (immutable runtime values)
         self._apply_context(channels)
@@ -811,6 +813,18 @@ class PregelLoop:
                                 )
                                 if cache_key is not None and result is not None:
                                     self._store_cache(cache_key, node_spec.cache_policy, result)
+                        except GraphInterrupt as gi:
+                            _current_config.reset(send_token)
+                            completed_nodes.add(send.node)
+                            checkpoint = self._checkpoint_from_channels(channels, checkpoint)
+                            next_for_checkpoint = new_next - completed_nodes
+                            checkpoint["_next_nodes"] = list(next_for_checkpoint)
+                            checkpoint["_completed_nodes"] = list(completed_nodes)
+                            self._save_interrupts(config, checkpoint, gi.interrupts)
+                            if "values" in modes:
+                                val = self._read_output(channels)
+                                yield ("values", val) if is_multi else val
+                            return
                         except GraphBubbleUp:
                             _current_config.reset(send_token)
                             raise
@@ -926,6 +940,14 @@ class PregelLoop:
             if ch == RESUME:
                 resume_value = val
 
+        # Apply pending writes from checkpoint (non-RESUME)
+        for tid, ch, val in pending_writes:
+            if ch == RESUME:
+                continue
+            if ch in channels and val is not None:
+                channels[ch].update([val])
+
+        # Apply input (user input takes priority over pending writes)
         if isinstance(input, Command):
             if input.update:
                 self._apply_input(input.update, channels)
@@ -935,13 +957,6 @@ class PregelLoop:
             self._apply_input(input, channels)
         else:
             self._apply_input({"__root__": input}, channels)
-
-        # Apply pending writes from checkpoint (non-RESUME)
-        for tid, ch, val in pending_writes:
-            if ch == RESUME:
-                continue
-            if ch in channels and val is not None:
-                channels[ch].update([val])
 
         # Apply context (immutable runtime values)
         self._apply_context(channels)
@@ -1387,6 +1402,18 @@ class PregelLoop:
                                 )
                                 if cache_key is not None and result is not None:
                                     self._store_cache(cache_key, node_spec.cache_policy, result)
+                        except GraphInterrupt as gi:
+                            _current_config.reset(send_token)
+                            completed_nodes.add(send.node)
+                            checkpoint = self._checkpoint_from_channels(channels, checkpoint)
+                            next_for_checkpoint = new_next - completed_nodes
+                            checkpoint["_next_nodes"] = list(next_for_checkpoint)
+                            checkpoint["_completed_nodes"] = list(completed_nodes)
+                            self._save_interrupts(config, checkpoint, gi.interrupts)
+                            if "values" in modes:
+                                val = self._read_output(channels)
+                                yield ("values", val) if is_multi else val
+                            return
                         except GraphBubbleUp:
                             _current_config.reset(send_token)
                             raise
@@ -1688,6 +1715,8 @@ class PregelLoop:
         for attempt in range(max_attempts):
             try:
                 return self._execute_func(func, node_input)
+            except GraphBubbleUp:
+                raise
             except Exception as e:
                 retry_on = retry_policy.retry_on
                 should_retry = False
@@ -1713,10 +1742,11 @@ class PregelLoop:
                            retry_policy: RetryPolicy | None,
                            timeout_seconds: float) -> Any:
         """Execute a node function with a timeout."""
+        ctx = contextvars.copy_context()
         if retry_policy is None:
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
-                future = pool.submit(self._execute_func, func, node_input)
+                future = pool.submit(ctx.run, self._execute_func, func, node_input)
                 return future.result(timeout=timeout_seconds)
             except concurrent.futures.TimeoutError:
                 raise TimeoutError(
@@ -1729,7 +1759,7 @@ class PregelLoop:
         for attempt in range(max_attempts):
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
-                future = pool.submit(self._execute_func, func, node_input)
+                future = pool.submit(ctx.run, self._execute_func, func, node_input)
                 return future.result(timeout=timeout_seconds)
             except concurrent.futures.TimeoutError:
                 if attempt >= max_attempts - 1:
@@ -1737,6 +1767,8 @@ class PregelLoop:
                         f"Node timed out after {timeout_seconds}s "
                         f"(attempt {attempt + 1}/{max_attempts})"
                     )
+            except GraphBubbleUp:
+                raise
             except Exception as e:
                 retry_on = retry_policy.retry_on
                 should_retry = False
@@ -1805,6 +1837,12 @@ class PregelLoop:
                         return future.result()
                 else:
                     return asyncio.run(result)
+            if inspect.isasyncgen(result):
+                result.close()
+                raise TypeError(
+                    "Node function returned an async generator. "
+                    "Use 'async def' with 'return' instead of 'yield'."
+                )
             if inspect.isgenerator(result):
                 r = None
                 try:
@@ -1826,23 +1864,32 @@ class PregelLoop:
         if hasattr(func, '_loop') and hasattr(func, 'builder'):
             return await self._aexecute_subgraph(func, node_input)
 
-        if timeout is not None and timeout > 0:
-            return await asyncio.wait_for(
-                self._acall_node_inner(func, node_input, retry_policy),
-                timeout=timeout,
-            )
-
-        return await self._acall_node_inner(func, node_input, retry_policy)
+        return await self._acall_node_inner(func, node_input, retry_policy, timeout)
 
     async def _acall_node_inner(self, func: Callable, node_input: Any,
-                                retry_policy: RetryPolicy | None = None) -> Any:
+                                retry_policy: RetryPolicy | None = None,
+                                timeout: float | None = None) -> Any:
         if retry_policy is None:
-            return await self._aexecute_func(func, node_input)
+            coro = self._aexecute_func(func, node_input)
+            if timeout is not None and timeout > 0:
+                return await asyncio.wait_for(coro, timeout=timeout)
+            return await coro
 
         max_attempts = retry_policy.max_attempts
         for attempt in range(max_attempts):
             try:
-                return await self._aexecute_func(func, node_input)
+                coro = self._aexecute_func(func, node_input)
+                if timeout is not None and timeout > 0:
+                    return await asyncio.wait_for(coro, timeout=timeout)
+                return await coro
+            except asyncio.TimeoutError:
+                if attempt >= max_attempts - 1:
+                    raise TimeoutError(
+                        f"Node timed out after {timeout}s "
+                        f"(attempt {attempt + 1}/{max_attempts})"
+                    )
+            except GraphBubbleUp:
+                raise
             except Exception as e:
                 retry_on = retry_policy.retry_on
                 should_retry = False
@@ -1875,6 +1922,12 @@ class PregelLoop:
             result = func(*args)
             if asyncio.iscoroutine(result):
                 return await result
+            if inspect.isasyncgen(result):
+                await result.aclose()
+                raise TypeError(
+                    "Node function returned an async generator. "
+                    "Use 'async def' with 'return' instead of 'yield'."
+                )
             if inspect.isgenerator(result):
                 r = None
                 try:
@@ -2263,7 +2316,14 @@ class PregelLoop:
         if isinstance(input, dict):
             for key, val in input.items():
                 if key in channels:
-                    channels[key].update([val])
+                    if isinstance(val, Overwrite):
+                        ch = channels[key]
+                        if isinstance(ch, BinaryOperatorAggregate):
+                            ch.update([Overwrite(value=val.value)])
+                        else:
+                            ch.update([val.value])
+                    else:
+                        channels[key].update([val])
         elif "__root__" in channels:
             channels["__root__"].update([input])
 
@@ -2365,7 +2425,7 @@ class PregelLoop:
             return None
         if cache_policy.key_func is not None:
             return cache_policy.key_func(node_name, node_input)
-        return f"{node_name}:{hash(repr(node_input))}"
+        return f"{node_name}:{hashlib.sha256(repr(node_input).encode()).hexdigest()[:16]}"
 
     def _check_cache(self, cache_key: str | None,
                      cache_policy: Any) -> Any | None:

@@ -15,5 +15,5 @@ def _deepcopy_or_warn(value):
     try:
         return copy.deepcopy(value)
     except Exception:
-        _logger.debug("deepcopy failed for %s, using original reference", type(value).__name__)
+        _logger.warning("deepcopy failed for %s, using original reference", type(value).__name__)
         return value

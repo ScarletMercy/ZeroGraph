@@ -54,10 +54,18 @@ def _escape_label(name: str) -> str:
         .replace('&', '&amp;')
         .replace('"', '&quot;')
         .replace('[', '&#91;')
-        .replace(']', '&#93;'))
+        .replace(']', '&#93;')
+        .replace('\n', '&#10;')
+        .replace('\r', '')
+        .replace('{', '&#123;')
+        .replace('}', '&#125;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;'))
 
 
 def _safe_id(name: str) -> str:
     base = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-    h = hashlib.md5(name.encode()).hexdigest()[:6]
+    h = hashlib.sha256(name.encode()).hexdigest()[:6]
+    if base and base[0].isdigit():
+        base = f"n_{base}"
     return f"{base}_{h}"

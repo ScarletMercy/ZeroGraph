@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from zerograph.constants import INTERRUPT
 from zerograph.checkpoint.base import (
     BaseCheckpointSaver,
     Checkpoint,
@@ -22,52 +23,63 @@ from zerograph.checkpoint.base import (
 __all__ = ("SqliteSaver", "AsyncSqliteSaver")
 
 
-_ZG_TYPE = "__zerograph_type__"
+_ZG_TYPE = "__zg_v1_type__"
+_ZG_VERSION = "__zg_v1_v__"
+_ZG_TYPE_LEGACY = "__zerograph_type__"
 
 
 class _CheckpointEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, frozenset):
-            return {_ZG_TYPE: "frozenset", "data": sorted(obj, key=repr)}
+            return {_ZG_TYPE: "frozenset", _ZG_VERSION: 1, "data": sorted(obj, key=repr)}
         if isinstance(obj, set):
-            return {_ZG_TYPE: "set", "data": sorted(obj, key=repr)}
-        if isinstance(obj, tuple):
-            return {_ZG_TYPE: "tuple", "data": list(obj)}
+            return {_ZG_TYPE: "set", _ZG_VERSION: 1, "data": sorted(obj, key=repr)}
         if isinstance(obj, bytes):
-            return {_ZG_TYPE: "bytes", "data": obj.hex()}
+            return {_ZG_TYPE: "bytes", _ZG_VERSION: 1, "data": obj.hex()}
         if isinstance(obj, datetime):
-            return {_ZG_TYPE: "datetime", "data": obj.isoformat()}
+            return {_ZG_TYPE: "datetime", _ZG_VERSION: 1, "data": obj.isoformat()}
         if isinstance(obj, timedelta):
-            return {_ZG_TYPE: "timedelta", "data": obj.total_seconds()}
+            return {_ZG_TYPE: "timedelta", _ZG_VERSION: 1, "data": obj.total_seconds()}
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+def _prepare_for_json(obj):
+    if isinstance(obj, tuple):
+        return {_ZG_TYPE: "tuple", _ZG_VERSION: 1, "data": [_prepare_for_json(x) for x in obj]}
+    if isinstance(obj, list):
+        return [_prepare_for_json(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _prepare_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (set, frozenset, bytes, datetime, timedelta)):
+        return obj
+    return obj
+
+
 def _decode_obj(obj):
-    if isinstance(obj, dict) and _ZG_TYPE in obj:
-        t = obj[_ZG_TYPE]
-        if t == "set":
-            if "data" in obj:
+    if isinstance(obj, dict):
+        t = None
+        if _ZG_TYPE in obj and _ZG_VERSION in obj:
+            t = obj[_ZG_TYPE]
+        elif _ZG_TYPE_LEGACY in obj:
+            t = obj[_ZG_TYPE_LEGACY]
+        if t is not None:
+            if t == "set" and "data" in obj:
                 return set(obj["data"])
-        if t == "frozenset":
-            if "data" in obj:
+            if t == "frozenset" and "data" in obj:
                 return frozenset(obj["data"])
-        if t == "tuple":
-            if "data" in obj:
+            if t == "tuple" and "data" in obj:
                 return tuple(obj["data"])
-        if t == "bytes":
-            if "data" in obj:
+            if t == "bytes" and "data" in obj:
                 return bytes.fromhex(obj["data"])
-        if t == "datetime":
-            if "data" in obj:
+            if t == "datetime" and "data" in obj:
                 return datetime.fromisoformat(obj["data"])
-        if t == "timedelta":
-            if "data" in obj:
+            if t == "timedelta" and "data" in obj:
                 return timedelta(seconds=obj["data"])
     return obj
 
 
 def _dump_json(obj) -> str:
-    return json.dumps(obj, cls=_CheckpointEncoder)
+    return json.dumps(_prepare_for_json(obj), cls=_CheckpointEncoder)
 
 
 def _load_json(text: str) -> Any:
@@ -117,9 +129,12 @@ class SqliteSaver(BaseCheckpointSaver):
         self._local = threading.local()
         self._lock = threading.Lock()
         self._connections: set[sqlite3.Connection] = set()
+        self._closed = False
         self._get_conn()
 
     def _get_conn(self) -> sqlite3.Connection:
+        if self._closed:
+            raise RuntimeError("SqliteSaver is closed")
         if not hasattr(self._local, "conn") or self._local.conn is None:
             conn = sqlite3.connect(self._conn_string, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -145,6 +160,7 @@ class SqliteSaver(BaseCheckpointSaver):
         with self._lock:
             conns = list(self._connections)
             self._connections.clear()
+            self._closed = True
         for conn in conns:
             try:
                 conn.close()
@@ -276,7 +292,7 @@ class SqliteSaver(BaseCheckpointSaver):
 
         for tid, ch, val in writes:
             tid = tid or task_id
-            if isinstance(val, InterruptCls):
+            if ch == INTERRUPT and isinstance(val, InterruptCls):
                 val = {"__interrupt__": True, "value": val.value, "id": val.id}
             conn.execute(
                 "INSERT OR REPLACE INTO pending_writes "
@@ -435,6 +451,7 @@ class AsyncSqliteSaver(SqliteSaver):
         self._lock = threading.Lock()
         self._is_memory = self._conn_string == ":memory:"
         self._connections: set[sqlite3.Connection] = set()
+        self._closed = False
         if self._is_memory:
             import concurrent.futures
             self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -451,7 +468,7 @@ class AsyncSqliteSaver(SqliteSaver):
 
     def close(self) -> None:
         if self._executor is not None:
-            self._executor.shutdown(wait=False)
+            self._executor.shutdown(wait=True)
             self._executor = None
         super().close()
 

@@ -22,7 +22,7 @@ __all__ = ("entrypoint", "task")
 class _TaskFuture:
     """Future-like object returned by @task decorated functions."""
 
-    __slots__ = ("_func", "_args", "_kwargs", "_result", "_done", "_exception", "_lock", "_executing")
+    __slots__ = ("_func", "_args", "_kwargs", "_result", "_done", "_exception", "_lock", "_executing", "_event")
 
     def __init__(self, func: Callable, args: tuple, kwargs: dict) -> None:
         self._func = func
@@ -33,22 +33,44 @@ class _TaskFuture:
         self._exception = None
         self._lock = threading.Lock()
         self._executing = False
+        self._event = None
 
     def result(self) -> Any:
         with self._lock:
+            if self._executing:
+                raise RuntimeError(
+                    f"Task '{self._func.__name__}' is already being executed "
+                    "asynchronously. Use await task.aresult() instead."
+                )
             if not self._done:
                 try:
-                    self._result = self._func(*self._args, **self._kwargs)
+                    raw = self._func(*self._args, **self._kwargs)
+                    if asyncio.iscoroutine(raw):
+                        raw.close()
+                        raise RuntimeError(
+                            f"Task '{self._func.__name__}' is an async function. "
+                            "Use await task.aresult() instead of task.result()."
+                        )
+                    self._result = raw
                     self._done = True
+                    self._func = None
+                    self._args = None
+                    self._kwargs = None
                 except Exception as e:
                     self._exception = e
                     self._done = True
+                    self._func = None
+                    self._args = None
+                    self._kwargs = None
                     raise
             if self._exception is not None:
                 raise self._exception
             return self._result
 
     async def aresult(self) -> Any:
+        # threading.Lock.acquire() is used intentionally: the critical section
+        # only reads/writes a few booleans (nanoseconds).  After Bug #4 fix,
+        # result() will refuse to run concurrently, so this never blocks long.
         should_execute = False
         self._lock.acquire()
         try:
@@ -63,7 +85,6 @@ class _TaskFuture:
             self._lock.release()
 
         if should_execute:
-            # We claimed execution rights — run the function.
             try:
                 if asyncio.iscoroutinefunction(self._func):
                     result = await self._func(*self._args, **self._kwargs)
@@ -74,21 +95,32 @@ class _TaskFuture:
                     self._exception = e
                     self._done = True
                     self._executing = False
+                    self._func = None
+                    self._args = None
+                    self._kwargs = None
+                if self._event is not None:
+                    self._event.set()
                 raise
             with self._lock:
                 self._result = result
                 self._done = True
                 self._executing = False
+                self._func = None
+                self._args = None
+                self._kwargs = None
+            if self._event is not None:
+                self._event.set()
             return result
 
-        # Another coroutine is executing — spin-wait for it to finish.
-        while True:
-            with self._lock:
-                if self._done:
-                    if self._exception is not None:
-                        raise self._exception
-                    return self._result
-            await asyncio.sleep(0)
+        with self._lock:
+            if self._event is None:
+                self._event = asyncio.Event()
+            event = self._event
+        await event.wait()
+        with self._lock:
+            if self._exception is not None:
+                raise self._exception
+            return self._result
 
 
 def task(func: Callable) -> Callable:
@@ -209,7 +241,11 @@ class _EntrypointWrapper:
         """Build keyword arguments for the entrypoint function."""
         sig = inspect.signature(self._func)
         kwargs: dict[str, Any] = {}
-        for param_name, param in sig.parameters.items():
+        params = list(sig.parameters.items())
+        first_param_name = params[0][0] if params else None
+        for param_name, param in params:
+            if param_name == first_param_name:
+                continue
             if param_name in ("previous",):
                 kwargs[param_name] = self._get_previous(config)
             elif param_name in ("store",):

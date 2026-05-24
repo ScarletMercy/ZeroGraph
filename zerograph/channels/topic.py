@@ -81,7 +81,7 @@ class Topic(Generic[Value], BaseChannel[list[Value], Value, list[Value]]):
     def checkpoint(self):
         if not self.values:
             return MISSING
-        return _deepcopy_or_warn(self.values) if self.values else MISSING
+        return _deepcopy_or_warn(self.values)
 
     def consume(self) -> bool:
         if not self.accumulate and self.values:

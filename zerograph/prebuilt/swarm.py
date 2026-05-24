@@ -139,6 +139,13 @@ def create_swarm(
                     handoff = last.get("handoff")
                     if handoff and handoff in agent_name_set:
                         return handoff
+                    # Agent produced no tool calls and no handoff -> done
+                    return END
+
+                # If the last message is an assistant from a different agent
+                # with no tool_calls/handoff, end the swarm
+                if last.get("role") == "assistant":
+                    return END
 
                 return END
 
